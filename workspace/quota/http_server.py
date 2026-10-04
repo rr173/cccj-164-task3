@@ -14,6 +14,14 @@
   POST /api/leases/release     归还租约（释放未消费部分）
   POST /api/leases/revoke      父级撤销/缩容（有下级占用时拒绝）
   POST /api/clients/presence   客户端上/下线（离线关闭其全部租约）
+
+批量容量调整草案：
+  POST /api/drafts             创建草案 {items:[{node_id, capacity|delta}]}
+  POST /api/drafts/preview     预览 {draft_id}（推进陈旧锚点）
+  POST /api/drafts/publish     原子发布 {draft_id}（陈旧/任一项非法则整批不生效）
+  POST /api/drafts/discard     废弃草案 {draft_id}
+  GET  /api/drafts             草案列表（含状态/锚点/发布结果）
+  GET  /api/drafts?id=...      单个草案详情
 """
 
 from __future__ import annotations
@@ -101,6 +109,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self._service().audit())
             if path == "/api/events":
                 return self._json(200, {"events": self._service().events()})
+            if path == "/api/drafts":
+                qs = urlparse(self.path).query
+                draft_id = None
+                if qs:
+                    from urllib.parse import parse_qs
+                    draft_id = parse_qs(qs).get("id", [None])[0]
+                if draft_id:
+                    return self._json(200, self._service().draft(draft_id))
+                return self._json(200, self._service().list_drafts())
             if path in ("/", "/index.html"):
                 return self._serve_static("index.html", "text/html; charset=utf-8")
             if path.startswith("/static/"):
@@ -117,6 +134,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         try:
+            if path.startswith("/api/drafts"):
+                return self._handle_draft(path)
             kind = KIND_BY_PATH.get(path)
             if kind is None:
                 self._json(404, {"error": "not_found", "message": f"未知路径: {path}"})
@@ -130,6 +149,33 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.server.app_log(f"ERROR POST {path}: {exc!r}")
             self._json(500, {"error": "InternalError", "message": str(exc)})
+
+    DRAFT_OPS = {
+        "/api/drafts": "create",
+        "/api/drafts/preview": "preview",
+        "/api/drafts/publish": "publish",
+        "/api/drafts/discard": "discard",
+    }
+
+    def _handle_draft(self, path: str) -> None:
+        op = self.DRAFT_OPS.get(path)
+        if op is None:
+            self._json(404, {"error": "not_found", "message": f"未知路径: {path}"})
+            return
+        body = self._read_body()
+        svc = self._service()
+        if op == "create":
+            result = svc.create_draft(body)
+        elif op == "preview":
+            # 预览是只读模拟（顺带以系统事件刷新陈旧锚点），语义为查询 → 200
+            result = svc.preview_draft(body)
+            return self._json(200, result)
+        elif op == "publish":
+            result = svc.publish_draft(body)
+        else:
+            result = svc.discard_draft(body)
+        code = 200 if result.get("replayed") else 201
+        self._json(code, result)
 
     # ------------------------------------------------------------------
     # 静态文件

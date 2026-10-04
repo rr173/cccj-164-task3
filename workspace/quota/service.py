@@ -20,10 +20,18 @@ from .domain import (
     PLATFORM_ID,
     RESULT_EXTRACTORS,
     ConflictError,
+    NotFoundError,
     Projection,
     ValidationError,
     apply_event,
     expired_lease_events,
+)
+from .drafts import (
+    assert_editable,
+    assert_fresh,
+    build_publish_events,
+    normalize_items,
+    simulate,
 )
 from .ledger import GENESIS_HASH, EventStore, canonical
 
@@ -152,6 +160,255 @@ class QuotaService:
         if len(items) == 1:
             result.update(items[0])
         return result
+
+    # ------------------------------------------------------------------
+    # 批量容量调整草案
+    # ------------------------------------------------------------------
+
+    def _get_draft(self, draft_id: Any) -> dict[str, Any]:
+        if not draft_id or not isinstance(draft_id, str):
+            raise ValidationError("draft_id 必填")
+        draft = self.projection.drafts.get(draft_id)
+        if draft is None:
+            raise NotFoundError(f"草案不存在: {draft_id}")
+        return draft
+
+    def create_draft(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self.store.lock:
+            self._apply_sweep_locked(time.time())
+            if not self.projection.bootstrapped:
+                raise ConflictError("平台尚未初始化，请先设置全局容量 (bootstrap)")
+
+            items = normalize_items(self.projection, body.get("items"))
+            draft_id = body.get("draft_id") or f"D-{canonical(items)[:16]}"
+            if not isinstance(draft_id, str) or not draft_id:
+                raise ValidationError("draft_id 非法")
+            if draft_id in self.projection.drafts:
+                raise ConflictError(f"草案 ID 已存在: {draft_id}")
+
+            command_id = (
+                body.get("command_id")
+                or f"draft-create:{draft_id}:{canonical(items)}"
+            )
+            fingerprint = canonical({"items": items, "draft_id": draft_id})
+            existing = self.store.get_command(command_id)
+            if existing is not None:
+                return {**existing["result"], "replayed": True}
+
+            event = {
+                "type": "DraftCreated",
+                "payload": {
+                    "draft_id": draft_id,
+                    "items": items,
+                    "base_seq": self.projection.seq,
+                    "created_at": time.time(),
+                },
+            }
+            result = {
+                "command": "draft_create",
+                "draft_id": draft_id,
+                "status": "draft",
+                "items": items,
+                "base_seq": self.projection.seq,
+                "event_count": 1,
+                "events": [{"event_type": "DraftCreated", "draft_id": draft_id}],
+            }
+            self.store.append_batch(
+                [event], command_id=command_id,
+                fingerprint=fingerprint, result=result,
+            )
+            self._apply_new([event])
+            return result
+
+    def preview_draft(self, body: dict[str, Any]) -> dict[str, Any]:
+        """重新计算整批执行后的逐层余额/受影响租约/拒绝原因，并推进陈旧锚点。
+
+        预览本身以系统事件（``sys:`` 前缀，不进命令回执表）落一笔
+        ``DraftPreviewed``，使锚点 == 预览事件的账本位置；同时让预览
+        记录可在重启后从账本恢复、可审计。
+        """
+        with self.store.lock:
+            self._apply_sweep_locked(time.time())
+            draft = self._get_draft(body.get("draft_id"))
+            if draft["status"] == "published":
+                raise ConflictError(
+                    f"草案 {draft['id']} 已发布，不能再次预览",
+                    details={"draft_id": draft["id"], "status": "published"},
+                )
+            assert_editable(draft, "预览")
+
+            was_stale = draft["base_seq"] != self.projection.seq
+            preview = simulate(self.projection, draft["items"], draft["id"])
+            summary = {
+                "valid": preview["valid"],
+                "event_count": preview["event_count"],
+                "rejected_count": len(preview["rejections"]),
+                "global_capacity_after": preview["global_capacity_after"],
+                "affected_lease_count": len(preview["affected_leases"]),
+            }
+            event = {
+                "type": "DraftPreviewed",
+                "payload": {
+                    "draft_id": draft["id"],
+                    "valid": preview["valid"],
+                    "previewed_at": time.time(),
+                    "summary": summary,
+                },
+            }
+            self.store.append_batch(
+                [event],
+                command_id=f"sys:draft:preview:{draft['id']}:{self.projection.seq}",
+                fingerprint="system",
+                result={},
+                system=True,
+            )
+            self._apply_new([event])
+            return {
+                "draft_id": draft["id"],
+                "status": draft["status"],
+                "base_seq": self.projection.seq,
+                "was_stale": was_stale,
+                **preview,
+            }
+
+    def publish_draft(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self.store.lock:
+            self._apply_sweep_locked(time.time())
+            draft = self._get_draft(body.get("draft_id"))
+
+            # 已发布：重复发布只能得到首次发布结果（幂等重放，不再落任何事件）
+            if draft["status"] == "published":
+                first = draft.get("published_result") or {}
+                return {**first, "replayed": True}
+            assert_editable(draft, "发布")
+
+            command_id = (
+                body.get("command_id")
+                or f"draft-publish:{draft['id']}:{draft['base_seq']}"
+            )
+            existing = self.store.get_command(command_id)
+            if existing is not None:
+                return {**existing["result"], "replayed": True}
+
+            # 乐观前提：草案锚点之后账本不得前进过（任何业务/系统事件）
+            assert_fresh(draft, self.projection.seq)
+
+            # 整批在深拷贝上重新规划：任一项不合法即抛错，尚未写入任何事件
+            business_events = build_publish_events(
+                self.projection, draft["items"], draft["id"]
+            )
+            preview = simulate(self.projection, draft["items"], draft["id"])
+            if not preview["valid"]:
+                # build_publish_events 理应先抛；兜底保证绝不落账
+                raise ConflictError("批量发布被拒绝：存在不合法条目（整批未生效）")
+
+            published_at = time.time()
+            all_events = business_events  # 占位，下方补上 DraftPublished 后重算长度
+            stored_result = {
+                "command": "draft_publish",
+                "draft_id": draft["id"],
+                "status": "published",
+                "published_at": published_at,
+                "applied_event_count": len(business_events),
+                "affected_leases": preview["affected_leases"],
+                "layers": preview["layers"],
+                "items": preview["items"],
+            }
+            publish_event = {
+                "type": "DraftPublished",
+                "payload": {
+                    "draft_id": draft["id"],
+                    "published_at": published_at,
+                    # 首次发布结果完整存于事件载荷：重启后重复发布仍返回它
+                    "result": stored_result,
+                },
+            }
+            all_events = business_events + [publish_event]
+            stored_result["event_count"] = len(all_events)
+            result = dict(stored_result)
+            self.store.append_batch(
+                all_events,
+                command_id=command_id,
+                fingerprint=canonical({"draft_id": draft["id"], "op": "publish"}),
+                result=result,
+            )
+            self._apply_new(all_events)
+            return result
+
+    def discard_draft(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self.store.lock:
+            self._apply_sweep_locked(time.time())
+            draft = self._get_draft(body.get("draft_id"))
+            if draft["status"] == "published":
+                raise ConflictError(
+                    f"草案 {draft['id']} 已发布，不能废弃",
+                    details={"draft_id": draft["id"], "status": "published"},
+                )
+            assert_editable(draft, "废弃")
+
+            command_id = (
+                body.get("command_id")
+                or f"draft-discard:{draft['id']}:{draft['base_seq']}"
+            )
+            existing = self.store.get_command(command_id)
+            if existing is not None:
+                return {**existing["result"], "replayed": True}
+
+            event = {
+                "type": "DraftDiscarded",
+                "payload": {"draft_id": draft["id"], "discarded_at": time.time()},
+            }
+            result = {
+                "command": "draft_discard",
+                "draft_id": draft["id"],
+                "status": "discarded",
+                "discarded_at": event["payload"]["discarded_at"],
+                "event_count": 1,
+            }
+            self.store.append_batch(
+                [event],
+                command_id=command_id,
+                fingerprint=canonical({"draft_id": draft["id"], "op": "discard"}),
+                result=result,
+            )
+            self._apply_new([event])
+            return result
+
+    def draft(self, draft_id: str) -> dict[str, Any]:
+        with self.store.lock:
+            self._apply_sweep_locked(time.time())
+            draft = self._get_draft(draft_id)
+            return self._draft_view(draft)
+
+    def list_drafts(self) -> dict[str, Any]:
+        with self.store.lock:
+            self._apply_sweep_locked(time.time())
+            return {
+                "current_seq": self.projection.seq,
+                "drafts": [
+                    self._draft_view(d)
+                    for d in sorted(
+                        self.projection.drafts.values(),
+                        key=lambda x: x["created_at"],
+                    )
+                ],
+            }
+
+    def _draft_view(self, draft: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": draft["id"],
+            "status": draft["status"],
+            "items": draft["items"],
+            "base_seq": draft["base_seq"],
+            "current_seq": self.projection.seq,
+            "stale": draft["status"] == "draft"
+            and draft["base_seq"] != self.projection.seq,
+            "created_at": draft["created_at"],
+            "last_preview": draft["last_preview"],
+            "published_at": draft.get("published_at"),
+            "published_result": draft.get("published_result"),
+            "discarded_at": draft.get("discarded_at"),
+        }
 
     # ------------------------------------------------------------------
     # 查询
@@ -340,6 +597,52 @@ class QuotaService:
                     "detail": f"从 {len(chain)} 条事件重放的状态与线上投影一致"
                     if replay_ok
                     else "重放状态与线上投影不一致（投影可能被外部破坏）",
+                }
+            )
+
+            # 8) 批量容量调整草案生命周期一致：
+            #    已发布草案必须有对应 DraftPublished 事件与原子批次，
+            #    已废弃草案不得又被发布；每条发布的业务事件数量与回执一致。
+            draft_problems = []
+            published_ids = set()
+            for r in chain:
+                if r["event_type"] == "DraftPublished":
+                    published_ids.add(json.loads(r["payload"]).get("draft_id"))
+            batch_sizes: dict[str, int] = {}
+            for r in chain:
+                if r["event_type"] in (
+                    "CapacityAdjusted",
+                    "LeaseGranted",
+                    "LeaseAdjusted",
+                ):
+                    pl = __import__("json").loads(r["payload"])
+                    did = pl.get("draft_id")
+                    if did:
+                        batch_sizes[did] = batch_sizes.get(did, 0) + 1
+            for did, d in self.projection.drafts.items():
+                if d["status"] == "published":
+                    if did not in published_ids:
+                        draft_problems.append(f"草案 {did} 状态已发布但账本无 DraftPublished 事件")
+                    stored = (d.get("published_result") or {}).get("applied_event_count")
+                    if stored is not None and stored != batch_sizes.get(did, 0):
+                        draft_problems.append(
+                            f"草案 {did} 回执记录 {stored} 条业务事件，账本实际 "
+                            f"{batch_sizes.get(did, 0)} 条"
+                        )
+                elif d["status"] == "discarded":
+                    if did in published_ids:
+                        draft_problems.append(f"草案 {did} 既废弃又发布，状态非法")
+                elif d["status"] != "draft":
+                    draft_problems.append(f"草案 {did} 状态非法: {d['status']}")
+            checks.append(
+                {
+                    "name": "draft_lifecycle",
+                    "ok": not draft_problems,
+                    "detail": (
+                        f"{len(self.projection.drafts)} 个草案生命周期与账本一致"
+                        if not draft_problems
+                        else "; ".join(draft_problems)
+                    ),
                 }
             )
 

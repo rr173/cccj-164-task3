@@ -16,7 +16,7 @@ python3 -m quota.http_server --port 8765 --db ./quota.db
 # 打开 http://localhost:8765/ 即为租约控制台
 ```
 
-跑测试（功能 / 并发 / 到期 / 离线 / 续约 / 重启重建 / 账本篡改，共 147 项）：
+跑测试（功能 / 并发 / 到期 / 离线 / 续约 / 重启重建 / 账本篡改 / 批量容量草案，共 195 项）：
 
 ```bash
 python3 test_service.py
@@ -49,6 +49,8 @@ HTTP (http_server.py)
 | `LeaseAmended` | 修订有效期：截止时间延后，租约修订号 +1（不动余额） |
 | `LeaseClosed` | 结算租约，退回未消费余量（修订号同样 +1） |
 | `ClientPresenceChanged` | 客户端上 / 下线 |
+| `LeaseAdjusted` | 批量容量调整在租约边上的落点：收缩授予量（不动消费量） |
+| `DraftCreated` / `DraftPreviewed` / `DraftPublished` / `DraftDiscarded` | 批量容量调整草案生命周期（含发布锚点与首次发布结果） |
 
 每条事件带 `prev_hash/event_hash`（SHA-256 链）与所属 `command_id`，
 篡改任意载荷都会让审计的哈希链检查断裂。
@@ -117,6 +119,43 @@ HTTP (http_server.py)
 4. **幂等命令表 + 用量回执**：相同 `command_id` / `Idempotency-Key` 重放原
    结果；相同 `usage_event_id` 绝不二次扣减。
 
+### 批量容量调整草案（原子批次 + 乐观版本）
+
+管理员可把多条**节点容量变更**编辑成一个草案（draft）。节点容量定义：
+平台为 `global_capacity`；其余节点为其 live 入边（`active`+`pending_expired`）
+授予量之和。条目支持绝对目标 `capacity` 或相对 `delta`。
+
+1. **创建**（`POST /api/drafts`）：做参数级校验（节点存在、每节点一条、
+   容量非负），并锚定创建时账本位置 `base_seq`。
+2. **预览**（`POST /api/drafts/preview`）：在投影的深拷贝上模拟整批，返回
+   - `layers`：每个受影响节点容量/可用的「执行前→执行后」逐层余额；
+   - `affected_leases`：被收缩/新增的租约边（前后授予量）；
+   - `rejections`：逐项拒绝原因（`oversold` / `client_offline` /
+     `unchanged` …），一次性列出所有不合法条目；
+   - `valid=false` 时发布必然整批不生效。预览本身追加一笔系统事件
+     `DraftPreviewed`，把锚点推进到预览事件自身位置（重启可查）。
+3. **发布**（`POST /api/drafts/publish`）：
+   - **乐观前提**：锚点之后账本若前进过（新的授约/消费/续约/到期结算/
+     容量调整…），返回 `409` 且 `details.stale=true`，要求重新预览；
+   - 整批在深拷贝上重新规划，**任一项不合法就整批不生效**（不追加任何
+     业务事件）；全部合法才把业务事件 + `DraftPublished` 作为**一个
+     原子批次**写入哈希链；
+   - 首次发布结果（逐层余额、受影响租约、事件数）完整存于事件载荷，
+     **重复发布只能得到首次发布结果**（`replayed=true`）。
+4. **废弃**（`POST /api/drafts/discard`）：追加 `DraftDiscarded`，此后
+   不能再预览或发布。
+
+**缩容记账**：非平台节点缩容时，按授予时间*从新到旧*贪心从入边收回，
+每条边最多缩到其已消费量（已消费永不消失，是硬下限）；被缩边产生
+`LeaseAdjusted`（lessor 收回、holder 让出，`Σ余额`与总消费不变）。
+扩容则向父级新租一条永久租约，受父级当前可用约束。一批中先自顶向下
+执行全部扩容、再自底向上执行全部缩容，以最大化整批可行性。
+
+草案状态（`draft/published/discarded`）、锚点、首次发布结果与审计
+记录都只存在于事件账本，服务重启后完整恢复；审计新增 `draft_lifecycle`
+检查，核对发布事件与原子批次的业务事件数量一致、草案不出现「既废弃
+又发布」等非法状态。
+
 ---
 
 ## HTTP API
@@ -132,6 +171,11 @@ HTTP (http_server.py)
 | `POST /api/leases/release` | `{lease_id, expected_revision?}` 归还（释放未消费） |
 | `POST /api/leases/revoke` | `{lease_id, expected_revision?}` 父级撤销 / 缩容 |
 | `POST /api/clients/presence` | `{client_id, online}` 上 / 下线 |
+| `POST /api/drafts` | `{draft_id?, items:[{node_id, capacity|delta}]}` 创建批量容量草案 |
+| `POST /api/drafts/preview` | `{draft_id}` 预览逐层余额/受影响租约/拒绝原因（推进陈旧锚点） |
+| `POST /api/drafts/publish` | `{draft_id}` 原子发布；陈旧或任一项非法则整批不生效 |
+| `POST /api/drafts/discard` | `{draft_id}` 废弃草案 |
+| `GET /api/drafts` / `?id=` | 草案列表 / 单个草案（状态、锚点、发布结果） |
 | `GET /api/state` | 全量节点余额 + 租约视图 |
 | `GET /api/audit` | 一致性审计（见下） |
 | `GET /api/events` | 最近事件账本 |
@@ -143,9 +187,10 @@ HTTP (http_server.py)
 
 ### 审计 `GET /api/audit`
 
-每次执行 7 项检查：哈希链完整、幂等命令表一致、非负余额、全局守恒、
-层级边完整、租约记账合法、以及**从事件重放重建的状态与线上投影逐字段
-一致**（`replay_equivalence`）。
+每次执行 8 项检查：哈希链完整、幂等命令表一致、非负余额、全局守恒、
+层级边完整、租约记账合法、**从事件重放重建的状态与线上投影逐字段
+一致**（`replay_equivalence`），以及**批量容量草案生命周期与原子
+批次一致**（`draft_lifecycle`）。
 
 ---
 
@@ -155,7 +200,8 @@ HTTP (http_server.py)
 |---|---|
 | `quota/ledger.py` | SQLite 事件存储、确定性哈希、批量原子提交 |
 | `quota/domain.py` | 事件折叠、命令校验、余额模型、到期结算 |
-| `quota/service.py` | 命令执行 / 幂等 / 重建 / 后台 sweep / 审计 |
+| `quota/drafts.py` | 批量容量草案：条目校验、逐层模拟、原子发布规划、陈旧检测 |
+| `quota/service.py` | 命令执行 / 幂等 / 草案生命周期 / 重建 / 后台 sweep / 审计 |
 | `quota/http_server.py` | HTTP 路由与静态页面 |
-| `static/index.html` | 租约控制台（节点树、租约操作、审计、账本） |
-| `test_service.py` | 147 项端到端测试（含真实重启、并发与续约竞争） |
+| `static/index.html` | 租约控制台（节点树、租约操作、容量草案、审计、账本） |
+| `test_service.py` | 195 项端到端测试（含真实重启、并发、续约竞争与批量草案） |

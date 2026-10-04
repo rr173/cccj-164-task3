@@ -77,6 +77,11 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
+def canonical_draft_items(items: list[dict[str, Any]]) -> list[tuple[str, int]]:
+    """草案条目的稳定签名（node_id, target_capacity），供重放比对。"""
+    return [(str(it["node_id"]), int(it["target_capacity"])) for it in items]
+
+
 # ----------------------------------------------------------------------
 # 投影
 # ----------------------------------------------------------------------
@@ -93,6 +98,10 @@ class Projection:
         self.children: dict[str, list[str]] = {}
         self.leases: dict[str, dict[str, Any]] = {}
         self.usage_event_ids: set[str] = set()
+        # 批量容量调整草案（事件溯源折叠出的读模型）：
+        # draft_id -> {status, items, base_seq, created_at, last_preview,
+        #              published_result, published_at, discarded_at}
+        self.drafts: dict[str, dict[str, Any]] = {}
 
     # ---- 派生读模型 --------------------------------------------------
 
@@ -142,6 +151,7 @@ class Projection:
             **lease,
             "remaining": self.edge_remaining(lease),
             "amendment_count": len(lease["amendments"]),
+            "adjustment_count": len(lease.get("adjustments", [])),
             "lessor_type": self.nodes.get(lease["lessor_id"], {}).get("type"),
             "holder_type": self.nodes.get(lease["holder_id"], {}).get("type"),
         }
@@ -217,6 +227,17 @@ class Projection:
             ),
             "presence": sorted(
                 (nid, n["online"]) for nid, n in self.nodes.items()
+            ),
+            "drafts": sorted(
+                (
+                    did,
+                    d["status"],
+                    d["base_seq"],
+                    canonical_draft_items(d["items"]),
+                    d["published_at"],
+                    d["discarded_at"],
+                )
+                for did, d in self.drafts.items()
             ),
         }
 
@@ -334,6 +355,26 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
             }
         )
 
+    elif t == "LeaseAdjusted":
+        # 批量容量调整在租约边上的落点：只改边的授予量（不动任何消费量）。
+        # Δ = new_amount − amount；
+        #   Δ<0（缩边）：lessor 收回 −Δ，holder 让出 −Δ
+        #   Δ>0（放边）：lessor 放出 Δ，holder 增加 Δ
+        # 因此 Σ余额 不变、消费量不变，只重新分配父子间的额度。
+        lease = p.leases[evt["lease_id"]]
+        delta = evt["new_amount"] - lease["amount"]
+        lease["amount"] = evt["new_amount"]
+        p.balance[lease["lessor_id"]] -= delta
+        p.balance[lease["holder_id"]] += delta
+        lease.setdefault("adjustments", []).append(
+            {
+                "draft_id": evt["draft_id"],
+                "old_amount": evt["old_amount"],
+                "new_amount": evt["new_amount"],
+                "adjusted_at": evt["adjusted_at"],
+            }
+        )
+
     elif t == "LeaseClosed":
         lease = p.leases[evt["lease_id"]]
         remaining = lease["amount"] - lease["consumed"]
@@ -348,6 +389,48 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
 
     elif t == "ClientPresenceChanged":
         p.nodes[evt["client_id"]]["online"] = evt["online"]
+
+    # ---- 批量容量调整草案生命周期（只追加、可审计、重启可恢复）----
+
+    elif t == "DraftCreated":
+        p.drafts[evt["draft_id"]] = {
+            "id": evt["draft_id"],
+            "status": "draft",
+            "items": evt["items"],
+            "base_seq": evt["base_seq"],
+            "created_at": evt["created_at"],
+            "created_command_id": evt.get("command_id"),
+            "last_preview": None,
+            "published_result": None,
+            "published_at": None,
+            "published_command_id": None,
+            "discarded_at": None,
+        }
+
+    elif t == "DraftPreviewed":
+        # 预览在账本上留下锚点：base_seq 推进到预览事件自身的位置，
+        # 此后任何新业务事件（授约/消费/续约/结算…）都会使草案变陈旧。
+        d = p.drafts[evt["draft_id"]]
+        d["base_seq"] = evt["seq"]
+        d["last_preview"] = {
+            "seq": evt["seq"],
+            "valid": evt["valid"],
+            "previewed_at": evt["previewed_at"],
+            "summary": evt.get("summary"),
+        }
+
+    elif t == "DraftPublished":
+        d = p.drafts[evt["draft_id"]]
+        d["status"] = "published"
+        d["published_at"] = evt["published_at"]
+        d["published_command_id"] = evt.get("command_id")
+        d["published_result"] = evt.get("result")
+
+    elif t == "DraftDiscarded":
+        d = p.drafts[evt["draft_id"]]
+        d["status"] = "discarded"
+        d["discarded_at"] = evt["discarded_at"]
+        d["discarded_command_id"] = evt.get("command_id")
 
     else:
         raise ValidationError(f"未知事件类型: {t}")
@@ -838,4 +921,20 @@ RESULT_EXTRACTORS = {
         "client_id": pl["client_id"],
         "online": pl["online"],
     },
+    "LeaseAdjusted": lambda pl: {
+        "lease_id": pl["lease_id"],
+        "draft_id": pl["draft_id"],
+        "old_amount": pl["old_amount"],
+        "new_amount": pl["new_amount"],
+        "lessor_id": pl["lessor_id"],
+        "holder_id": pl["holder_id"],
+    },
+    "DraftCreated": lambda pl: {"draft_id": pl["draft_id"], "items": pl["items"]},
+    "DraftPreviewed": lambda pl: {
+        "draft_id": pl["draft_id"],
+        "base_seq": pl["base_seq"],
+        "valid": pl["valid"],
+    },
+    "DraftPublished": lambda pl: {"draft_id": pl["draft_id"]},
+    "DraftDiscarded": lambda pl: {"draft_id": pl["draft_id"]},
 }

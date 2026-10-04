@@ -729,6 +729,209 @@ def test_lease_amend(srv: Server):
     check("不带修订号的归还仍成功（向后兼容）", code == 201, f"code={code}")
 
 
+def test_batch_capacity_drafts(_srv: Server):
+    print("\n[12] 批量容量调整草案（原子批次 / 陈旧版本 / 重放 / 废弃 / 重启 / 审计）")
+    srv = Server()  # 独立干净账本，避免前序用例的余额/租约干扰逐层断言
+    try:
+        _batch_capacity_drafts_body(srv)
+    finally:
+        srv.stop()
+
+
+def _batch_capacity_drafts_body(srv: Server):
+    c = srv.client
+    c.post("/api/bootstrap", {"capacity": 1000})
+    for nid, t, pid in [
+        ("org-d", "organization", "platform"),
+        ("proj-d", "project", "org-d"),
+        ("cli-d", "client", "proj-d"),
+        ("cli-d2", "client", "proj-d"),
+    ]:
+        c.post("/api/nodes", {"type": t, "parent_id": pid, "node_id": nid})
+    # platform -> org-d 400 -> proj-d 300 -> cli-d 200
+    c.post("/api/leases", {"lessor_id": "platform", "holder_id": "org-d", "amount": 400, "lease_id": "Ld-org"})
+    c.post("/api/leases", {"lessor_id": "org-d", "holder_id": "proj-d", "amount": 300, "lease_id": "Ld-proj"})
+    c.post("/api/leases", {"lessor_id": "proj-d", "holder_id": "cli-d", "amount": 200, "lease_id": "Ld-cli"})
+    c.post("/api/leases/usage", {"lease_id": "Ld-cli", "amount": 30, "usage_event_id": "evt-d1"})
+
+    # ---- 1) 创建草案：平台 -100、org-d -50、proj-d +40 ----
+    code, d = c.post("/api/drafts", {"draft_id": "D-1", "items": [
+        {"node_id": "platform", "capacity": 900},
+        {"node_id": "org-d", "capacity": 350},
+        {"node_id": "proj-d", "delta": 40},
+    ]})
+    check("创建草案 201，锚定当前账本 seq", code == 201 and d["status"] == "draft", f"{code} {d}")
+    base_seq = d["base_seq"]
+
+    # GET 可能与后台到期 sweep 竞争，故只校验字段存在；陈旧与否由后续步骤精确判定
+    code, got = c.get("/api/drafts?id=D-1")
+    check("GET 草案可查询", code == 200 and got["id"] == "D-1" and got["base_seq"] == base_seq,
+          str(got))
+
+    # ---- 2) 预览：逐层余额 / 受影响租约 / 全部合法 ----
+    code, pv = c.post("/api/drafts/preview", {"draft_id": "D-1"})
+    check("预览 200 且 valid", code == 200 and pv["valid"] is True, f"{code} valid={pv.get('valid')}")
+    layer = {x["node_id"]: x for x in pv["layers"]}
+    check("预览逐层余额覆盖 4 个本批相关节点",
+          {"platform", "org-d", "proj-d"} <= set(layer), str(sorted(layer)))
+    # 顺序：proj-d 先 +40（org 放出 40），随后平台缩 100（50 从 Ld-org 抽回）+ org 缩 50。
+    # org-d：100 − 40(放给proj) − 50(被平台从 Ld-org 收回) = 10
+    check("预览 org-d 可用 100→10",
+          layer["org-d"]["available_before"] == 100 and layer["org-d"]["available_after"] == 10,
+          str(layer.get("org-d")))
+    check("预览 proj-d 容量 300→340、可用 +40",
+          layer["proj-d"]["capacity_after"] == 340 and layer["proj-d"]["available_delta"] == 40,
+          str(layer.get("proj-d")))
+    check("预览受影响租约含 Ld-org（350）",
+          any(a["lease_id"] == "Ld-org" and a["new_amount"] == 350 for a in pv["affected_leases"]),
+          str(pv["affected_leases"]))
+    check("预览扩容产生一条新租约",
+          any(it["node_id"] == "proj-d" and len(it.get("new_leases", [])) == 1 for it in pv["items"]),
+          str(pv["items"]))
+    check("预览事件数=3（平台/缩边/扩容各一）", pv["event_count"] == 3, str(pv["event_count"]))
+
+    # 预览推进锚点
+    code, got = c.get("/api/drafts?id=D-1")
+    check("预览后锚点前进", got["base_seq"] > base_seq, str(got.get("base_seq")))
+
+    # ---- 3) 陈旧：预览后发生新消费，发布必须 409 并指明重新预览 ----
+    c.post("/api/leases/usage", {"lease_id": "Ld-cli", "amount": 5, "usage_event_id": "evt-d2"})
+    code, got = c.get("/api/drafts?id=D-1")
+    check("锚点后有新事件 → stale=true", code == 200 and got["stale"] is True, str(got.get("stale")))
+    code, err = c.post("/api/drafts/publish", {"draft_id": "D-1"})
+    check("陈旧版本发布 → 409 且 details.stale",
+          code == 409 and err.get("details", {}).get("stale") is True, f"{code} {err}")
+    check("拒绝信息要求重新预览", "重新预览" in err.get("message", ""), str(err.get("message")))
+    st = c.get("/api/state")[1]
+    check("陈旧拒绝后整批未生效（平台仍 1000）", st["global_capacity"] == 1000, str(st["global_capacity"]))
+
+    # 重新预览 → 锚点刷新 → 立即发布（中间不得有其它命令）
+    code, pv2 = c.post("/api/drafts/preview", {"draft_id": "D-1"})
+    check("重新预览提示 was_stale=true", code == 200 and pv2.get("was_stale") is True,
+          str(pv2.get("was_stale")))
+    code, pub = c.post("/api/drafts/publish", {"draft_id": "D-1", "command_id": "pub-D1"})
+    check("原子发布成功，落 3 条业务事件", code == 201 and pub["applied_event_count"] == 3,
+          f"{code} {pub}")
+    st = c.get("/api/state")[1]
+    bal = {n["id"]: n["available"] for n in st["nodes"]}
+    # 平台 1000→900：余额 = 900 −(Ld-org 350) = 550
+    check("发布后平台容量 900、可用 550",
+          st["global_capacity"] == 900 and bal["platform"] == 550, str(bal))
+    check("发布后 org-d 可用 10", bal["org-d"] == 10, str(bal))
+    ld_org = next(x for x in st["leases"] if x["id"] == "Ld-org")
+    check("Ld-org 被缩到 350、消费不变", ld_org["amount"] == 350 and ld_org["consumed"] == 35,
+          str(ld_org))
+    check("Ld-org 留有调整记录", ld_org["adjustment_count"] >= 1, str(ld_org.get("adjustment_count")))
+    ok, failed = audit_ok(c)
+    check("发布后审计通过（含 draft_lifecycle）", ok, str(failed))
+
+    # ---- 4) 重复发布只得到首次结果 ----
+    code, again = c.post("/api/drafts/publish", {"draft_id": "D-1", "command_id": "pub-D1"})
+    check("同 command_id 重复发布 → 200 重放", code == 200 and again.get("replayed") is True, f"{code}")
+    code, again2 = c.post("/api/drafts/publish", {"draft_id": "D-1"})
+    check("不同 command_id 重复发布仍只回首次结果（replayed, 3 事件）",
+          code == 200 and again2.get("replayed") is True
+          and again2["applied_event_count"] == 3, f"{code} {again2}")
+    code, _ = c.post("/api/drafts/preview", {"draft_id": "D-1"})
+    check("已发布草案不能再预览 → 409", code == 409, f"code={code}")
+    code, _ = c.post("/api/drafts/discard", {"draft_id": "D-1"})
+    check("已发布草案不能废弃 → 409", code == 409, f"code={code}")
+
+    # ---- 5) 任一项非法 → 整批不生效 ----
+    # cli-d 扩容 +500（proj-d 可用不足）；同时合法的 cli-d2 扩容 10
+    c.post("/api/leases", {"lessor_id": "proj-d", "holder_id": "cli-d2", "amount": 30, "lease_id": "Ld-cli2"})
+    code, d3 = c.post("/api/drafts", {"draft_id": "D-bad", "items": [
+        {"node_id": "cli-d", "delta": 500},
+        {"node_id": "cli-d2", "delta": 10},
+    ]})
+    check("创建含非法条目的草案仍成功（语义在预览/发布判）", code == 201, f"{code}")
+    code, pv3 = c.post("/api/drafts/preview", {"draft_id": "D-bad"})
+    check("预览 valid=false 且逐项给出拒绝原因",
+          code == 200 and pv3["valid"] is False and len(pv3["rejections"]) == 1,
+          str(pv3.get("rejections")))
+    check("拒绝项定位 index=0、code=oversold",
+          pv3["rejections"][0]["index"] == 0 and pv3["rejections"][0]["code"] == "oversold",
+          str(pv3["rejections"][0]))
+    code, err = c.post("/api/drafts/publish", {"draft_id": "D-bad"})
+    check("非法批次发布 → 409 整批不生效", code == 409, f"{code} {err}")
+    st = c.get("/api/state")[1]
+    bal = {n["id"]: n["available"] for n in st["nodes"]}
+    check("整批回滚：cli-d2 未获得 +10", bal["cli-d2"] == 30, str(bal))
+    code, _ = c.post("/api/drafts/discard", {"draft_id": "D-bad"})
+    check("废弃草案 201", code == 201, f"code={code}")
+    code, _ = c.post("/api/drafts/publish", {"draft_id": "D-bad"})
+    check("废弃后发布 → 409", code == 409, f"code={code}")
+    code, got = c.get("/api/drafts?id=D-bad")
+    check("废弃草案仍可查询且有 discarded_at",
+          code == 200 and got["status"] == "discarded" and got["discarded_at"], str(got))
+
+    # ---- 6) 已消费是缩容硬下限（消费永不消失）----
+    # proj-d 现容量 340，入边消费沿链=35；缩到 10 必被拒
+    code, d4 = c.post("/api/drafts", {"draft_id": "D-floor", "items": [
+        {"node_id": "proj-d", "capacity": 10},
+    ]})
+    code, pv4 = c.post("/api/drafts/preview", {"draft_id": "D-floor"})
+    rj0 = pv4["rejections"][0] if pv4.get("rejections") else {}
+    check("缩到已消费下限以下 → 预览拒绝（floor=35）",
+          code == 200 and pv4["valid"] is False and int(rj0.get("floor", -1)) == 35,
+          str(pv4.get("rejections")))
+    code, _ = c.post("/api/drafts/publish", {"draft_id": "D-floor"})
+    check("低于消费下限发布 → 409", code == 409, f"code={code}")
+
+    # ---- 7) 参数级非法（创建即 400/404）----
+    code, err = c.post("/api/drafts", {"items": []})
+    check("空 items → 400", code == 400, f"code={code}")
+    code, _ = c.post("/api/drafts", {"items": [{"node_id": "nope-x", "capacity": 1}]})
+    check("不存在节点 → 404", code == 404, f"code={code}")
+    code, _ = c.post("/api/drafts", {"items": [{"node_id": "proj-d"}]})
+    check("capacity/delta 都不给 → 400", code == 400, f"code={code}")
+    code, _ = c.post("/api/drafts", {"items": [
+        {"node_id": "proj-d", "capacity": 100}, {"node_id": "proj-d", "delta": 1}]})
+    check("同节点重复条目 → 400", code == 400, f"code={code}")
+    code, _ = c.post("/api/drafts", {"draft_id": "D-miss"})
+    code, _ = c.post("/api/drafts/preview", {"draft_id": "D-miss"})
+    check("不存在草案预览 → 404", code == 404, f"code={code}")
+
+    # ---- 8) 草案列表含状态/锚点/发布结果 ----
+    code, lst = c.get("/api/drafts")
+    ids = {x["id"]: x for x in lst["drafts"]}
+    check("草案列表含 D-1/D-bad/D-floor",
+          code == 200 and {"D-1", "D-bad", "D-floor"} <= set(ids), str(list(ids)))
+    check("列表中 D-1 已发布且带发布结果",
+          ids["D-1"]["status"] == "published"
+          and ids["D-1"]["published_result"]["applied_event_count"] == 3,
+          str(ids["D-1"].get("published_result")))
+
+    # ---- 9) 重启后草案 / 发布结果 / 审计可查 ----
+    srv.restart()
+    code, got = c.get("/api/drafts?id=D-1")
+    check("重启后已发布草案恢复", code == 200 and got["status"] == "published", str(got))
+    check("重启后首次发布结果完整恢复",
+          got["published_result"]["applied_event_count"] == 3
+          and {"platform", "org-d", "proj-d"}
+          <= {x["node_id"] for x in got["published_result"].get("layers", [])},
+          str(got["published_result"])[:200])
+    code, got = c.get("/api/drafts?id=D-bad")
+    check("重启后废弃草案恢复", code == 200 and got["status"] == "discarded", str(got))
+    code, again3 = c.post("/api/drafts/publish", {"draft_id": "D-1"})
+    check("重启后重复发布仍回首次结果",
+          code == 200 and again3.get("replayed") is True
+          and again3["applied_event_count"] == 3, f"{code} {again3}")
+    # 重启后若再发生业务事件，未结草案仍被判陈旧
+    code, d5 = c.post("/api/drafts", {"draft_id": "D-after", "items": [
+        {"node_id": "platform", "capacity": 800},
+    ]})
+    c.post("/api/drafts/preview", {"draft_id": "D-after"})
+    c.post("/api/leases/usage", {"lease_id": "Ld-cli", "amount": 1, "usage_event_id": "evt-d3"})
+    srv.restart()
+    code, err = c.post("/api/drafts/publish", {"draft_id": "D-after"})
+    check("重启后陈旧草案发布仍被拒 → 409 stale",
+          code == 409 and err.get("details", {}).get("stale") is True, f"{code} {err}")
+    ok, failed = audit_ok(c)
+    check("重启后审计全部通过（8 项含草案生命周期/重放等价）",
+          ok and len(audit_ok(c)[1] or []) == 0, str(failed))
+
+
 def test_tamper_detection(srv: Server):
     print("\n[11] 账本篡改检测（哈希链 + 重放不等价）")
     c = srv.client
@@ -762,6 +965,7 @@ def main():
         test_concurrent_replay_safe(srv)
         test_restart_rebuild(srv)
         test_lease_amend(srv)
+        test_batch_capacity_drafts(srv)
         test_tamper_detection(srv)
 
         print("\n[终态审计]")

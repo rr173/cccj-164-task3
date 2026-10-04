@@ -203,9 +203,43 @@
     </section>
   </div>
 
+  <!-- 批量容量调整草案 -->
+  <section class="card">
+    <h2>④ 批量容量调整草案 <em>多条节点容量变更 → 预览逐层余额/受影响租约 → 原子发布；陈旧版本必须重新预览</em></h2>
+    <form class="inline" id="f-draft-items" style="margin-bottom:10px">
+      <label class="f">节点
+        <select class="w-md" name="node_id" id="df-node"></select>
+      </label>
+      <label class="f">模式
+        <select class="w-sm" name="mode">
+          <option value="capacity">目标容量</option>
+          <option value="delta">增量 ±</option>
+        </select>
+      </label>
+      <label class="f">数值<input class="w-sm" name="value" type="number" value="0" required /></label>
+      <button type="button" class="ghost" id="df-add">加入条目</button>
+      <span class="muted" style="font-size:12px">缩容按授予时间「从新到旧」从入边收回，已消费量为硬下限。</span>
+    </form>
+    <div style="overflow-x:auto">
+      <table id="draft-items-table">
+        <thead><tr><th>#</th><th>节点</th><th class="num">当前容量</th><th>变更</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <form class="inline" id="f-draft" style="margin-top:10px">
+      <label class="f">草案 ID（可选）<input class="w-md" name="draft_id" placeholder="自动生成" /></label>
+      <button>创建草案</button>
+      <span class="muted" id="draft-edit-hint">先在上方编辑条目。</span>
+    </form>
+
+    <h2 style="margin-top:18px">草案列表</h2>
+    <div id="draft-list"><p class="muted">暂无草案。</p></div>
+    <pre class="log" id="draft-preview" style="display:none;margin-top:10px;max-height:300px"></pre>
+  </section>
+
   <!-- 租约表 -->
   <section class="card">
-    <h2>④ 租约与用量 <em>消费按 usage_event_id 幂等；归还/撤销/到期/离线只退未消费余量</em></h2>
+    <h2>⑤ 租约与用量 <em>消费按 usage_event_id 幂等；归还/撤销/到期/离线只退未消费余量；容量草案可收缩授予量</em></h2>
     <div style="overflow-x:auto">
       <table id="lease-table">
         <thead>
@@ -223,7 +257,7 @@
   <div class="grid">
     <!-- 审计 -->
     <section class="card">
-      <h2>⑤ 一致性审计 <em id="audit-time"></em></h2>
+      <h2>⑥ 一致性审计 <em id="audit-time"></em></h2>
       <div id="audit"><p class="muted">点击“立即审计”或等待自动刷新。</p></div>
     </section>
     <!-- 事件账本 -->
@@ -490,6 +524,191 @@ function renderLeases(s) {
   });
 }
 
+// ---- 批量容量调整草案 ----
+let draftItems = [];
+
+function nodeCapacityOf(s, nid) {
+  if (nid === "platform") return s.global_capacity;
+  return s.leases
+    .filter((l) => l.holder_id === nid && (l.status === "active" || l.status === "pending_expired"))
+    .reduce((sum, l) => sum + l.amount, 0);
+}
+
+function renderDraftEditor(s) {
+  if (!s.bootstrapped) return;
+  const sel = $("#df-node");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  s.nodes.forEach((n) => {
+    const o = document.createElement("option");
+    o.value = n.id;
+    o.textContent = `${n.id} (${TYPE_NAME[n.type]}, 容量 ${nodeCapacityOf(s, n.id)}, 可用 ${n.available})`;
+    sel.appendChild(o);
+  });
+  if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+
+  const tb = $("#draft-items-table tbody");
+  tb.innerHTML = "";
+  if (!draftItems.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty">还没有条目。用上方表单把节点容量变更加入草案。</td></tr>';
+    return;
+  }
+  draftItems.forEach((it, i) => {
+    const tr = document.createElement("tr");
+    const td = (txt) => { const c = document.createElement("td"); c.textContent = txt; return c; };
+    tr.appendChild(td(i + 1));
+    tr.appendChild(td(it.node_id));
+    tr.appendChild(td(nodeCapacityOf(s, it.node_id)));
+    const desc = it.delta !== undefined
+      ? `${it.delta >= 0 ? "+" : ""}${it.delta} → ${nodeCapacityOf(s, it.node_id) + it.delta}`
+      : `→ ${it.capacity}`;
+    tr.appendChild(td(desc));
+    const act = document.createElement("td");
+    const del = document.createElement("button");
+    del.className = "danger"; del.textContent = "移除";
+    del.onclick = () => { draftItems.splice(i, 1); renderDraftEditor(s); };
+    act.appendChild(del); tr.appendChild(act);
+    tb.appendChild(tr);
+  });
+}
+
+$("#df-add").onclick = () => {
+  const f = document.forms["f-draft-items"];
+  const nid = f.node_id.value;
+  const v = parseInt(f.value.value, 10);
+  if (!Number.isInteger(v)) return toast("请输入整数数值", false);
+  if (draftItems.some((x) => x.node_id === nid))
+    return toast("该节点已在草案中（每节点一条）", false);
+  draftItems.push(f.mode.value === "delta" ? { node_id: nid, delta: v } : { node_id: nid, capacity: v });
+  f.value.value = "0";
+  if (lastState) renderDraftEditor(lastState);
+};
+
+document.forms["f-draft"].onsubmit = async (e) => {
+  e.preventDefault();
+  if (!draftItems.length) return toast("请先加入至少一条容量变更", false);
+  const f = e.target;
+  const body = { items: draftItems, command_id: uid("draft") };
+  if (f.draft_id.value.trim()) body.draft_id = f.draft_id.value.trim();
+  try {
+    const r = await api("/api/drafts", body);
+    toast(`草案 ${r.draft_id} 已创建（锚点 #${r.base_seq}），请预览后发布`);
+    draftItems = []; f.draft_id.value = "";
+    if (lastState) renderDraftEditor(lastState);
+    await refreshDrafts();
+  } catch (err) { toast(err.message, false); }
+};
+
+function fmtPreview(pv) {
+  const lines = [];
+  lines.push(`草案 ${pv.draft_id} · 预览结果: ${pv.valid ? "✓ 整批可发布" : "✗ 存在拒绝项（发布将整批不生效）"}`
+    + ` · 业务事件 ${pv.event_count} · 锚点 #${pv.base_seq}${pv.was_stale ? "（此前已陈旧，本次已重新锚定）" : ""}`);
+  lines.push("");
+  lines.push("[逐层余额] 节点  容量(前→后)  可用(前→后 Δ)");
+  pv.layers.forEach((l) => {
+    lines.push(`  ${l.node_id.padEnd(12)} ${String(l.capacity_before).padStart(6)}→${String(l.capacity_after).padStart(6)}`
+      + `   ${String(l.available_before).padStart(6)}→${String(l.available_after).padStart(6)} (${l.available_delta >= 0 ? "+" : ""}${l.available_delta})`);
+  });
+  if (pv.affected_leases.length) {
+    lines.push("");
+    lines.push("[受影响租约] 边  授予量(前→后)  状态");
+    pv.affected_leases.forEach((a) => {
+      lines.push(`  ${a.lease_id.slice(0, 16).padEnd(18)} ${a.lessor_id}→ ${String(a.old_amount).padStart(5)}→${String(a.new_amount).padStart(5)}  (${a.lease_status})`);
+    });
+  }
+  if (pv.rejections.length) {
+    lines.push("");
+    lines.push("[拒绝原因]");
+    pv.rejections.forEach((r) => {
+      lines.push(`  #${r.index + 1} ${r.node_id} [${r.code}] ${r.reason}`);
+    });
+  }
+  return lines.join("\n");
+}
+
+async function actDraft(id, op, label) {
+  try {
+    const r = await api(`/api/drafts/${op}`, { draft_id: id, command_id: uid(`draft-${op}`) });
+    if (op === "preview") {
+      $("#draft-preview").style.display = "block";
+      $("#draft-preview").textContent = fmtPreview(r);
+      toast(r.valid ? "预览完成：整批可发布" : "预览完成：存在不合法条目，请查看拒绝原因", r.valid);
+    } else if (op === "publish") {
+      toast(`草案 ${id} 已原子发布（${r.applied_event_count} 条业务事件）`);
+      $("#draft-preview").style.display = "none";
+    } else {
+      toast(`草案 ${id} 已废弃`);
+    }
+    await Promise.all([refreshDrafts(), refreshState(), loadEvents(), runAudit(true)]);
+  } catch (err) {
+    if (op === "preview" && err.details) {
+      toast(err.message, false);
+    } else {
+      toast(err.message + (err.details && err.details.stale ? "（请重新预览）" : ""), false);
+    }
+    await refreshDrafts();
+  }
+}
+
+async function refreshDrafts() {
+  try {
+    const r = await api("/api/drafts");
+    const box = $("#draft-list");
+    box.innerHTML = "";
+    if (!r.drafts.length) {
+      box.innerHTML = '<p class="muted">暂无草案。</p>';
+      return;
+    }
+    const table = document.createElement("table");
+    table.innerHTML = `<thead><tr>
+      <th>草案</th><th>条目</th><th class="num">锚点/当前</th><th>状态</th><th>最近预览</th><th>操作</th>
+    </tr></thead>`;
+    const tb = document.createElement("tbody");
+    r.drafts.slice().reverse().forEach((d) => {
+      const tr = document.createElement("tr");
+      const td = (txt) => { const c = document.createElement("td"); c.textContent = txt; return c; };
+      tr.appendChild(td(d.id));
+      tr.appendChild(td(d.items.map((it) =>
+        `${it.node_id}:${it.target_capacity}`).join(", ")));
+      tr.appendChild(td(`#${d.base_seq} / #${d.current_seq}`));
+      const st = document.createElement("td");
+      const pill = document.createElement("span");
+      pill.className = "pill " + (d.status === "published" ? "released"
+        : d.status === "discarded" ? "offline" : d.stale ? "revoked" : "active");
+      let stText = { draft: "草案", published: "已发布", discarded: "已废弃" }[d.status];
+      if (d.status === "draft" && d.stale) stText += " · 陈旧";
+      pill.textContent = stText;
+      st.appendChild(pill); tr.appendChild(st);
+      tr.appendChild(td(d.last_preview
+        ? `${new Date(d.last_preview.previewed_at * 1000).toLocaleTimeString()} ${d.last_preview.valid ? "✓" : "✗"}`
+        : "—"));
+      const acts = document.createElement("td");
+      const wrap = document.createElement("div");
+      wrap.className = "row-actions";
+      if (d.status === "draft") {
+        const pb = document.createElement("button"); pb.className = "ghost"; pb.textContent = "预览";
+        pb.onclick = () => actDraft(d.id, "preview", "预览");
+        wrap.appendChild(pb);
+        const pub = document.createElement("button"); pub.textContent = "发布";
+        pub.onclick = () => { if (d.stale) toast("草案已陈旧，请先重新预览", false);
+          actDraft(d.id, "publish", "发布"); };
+        wrap.appendChild(pub);
+        const dis = document.createElement("button"); dis.className = "danger"; dis.textContent = "废弃";
+        dis.onclick = () => actDraft(d.id, "discard", "废弃");
+        wrap.appendChild(dis);
+      } else {
+        wrap.appendChild(document.createTextNode(d.status === "published"
+          ? `已发布 ${d.published_result ? d.published_result.applied_event_count : ""} 事件 · 重复发布回首次结果`
+          : "—"));
+      }
+      acts.appendChild(wrap); tr.appendChild(acts);
+      tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    box.appendChild(table);
+  } catch { /* 定时刷新容错 */ }
+}
+
 // ---- 审计 ----
 async function runAudit(silent) {
   try {
@@ -578,6 +797,7 @@ async function refreshState() {
     renderTree(s);
     renderForms(s);
     renderLeases(s);
+    renderDraftEditor(s);
   } catch { /* 网络抖动时保留旧画面 */ }
 }
 
@@ -585,12 +805,13 @@ async function refreshAll() {
   await refreshState();
   await loadEvents();
   await runAudit(true);
+  await refreshDrafts();
 }
 
 bindForms();
 refreshAll();
 setInterval(() => { if ($("#auto").checked) refreshState(); }, 2000);
-setInterval(() => { if ($("#auto").checked) { loadEvents(); runAudit(true); } }, 5000);
+setInterval(() => { if ($("#auto").checked) { loadEvents(); runAudit(true); refreshDrafts(); } }, 5000);
 </script>
 </body>
 </html>
