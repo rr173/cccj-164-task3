@@ -90,9 +90,14 @@ class Projection:
         self.total_consumed = 0
         self.nodes: dict[str, dict[str, Any]] = {}
         self.balance: dict[str, int] = {}
+        # 每个节点的显式容量（platform 与 global_capacity 镜像）。
+        # 非平台节点容量为 0 时，其额度完全来自父级租约。
+        self.node_capacity: dict[str, int] = {}
         self.children: dict[str, list[str]] = {}
         self.leases: dict[str, dict[str, Any]] = {}
         self.usage_event_ids: set[str] = set()
+        # 容量调整草案（从 CapacityPlan* 生命周期事件折叠，权威行在 capacity_plans 表）
+        self.plans: dict[str, dict[str, Any]] = {}
 
     # ---- 派生读模型 --------------------------------------------------
 
@@ -158,6 +163,7 @@ class Projection:
         view = {
             **n,
             "available": self.avail(node_id),
+            "capacity": self.node_capacity.get(node_id, 0),
             "incoming_remaining": sum(self.edge_remaining(l) for l in in_open),
             "outgoing_granted": sum(l["amount"] for l in out_open),
             "consumed": self._node_consumed(node_id),
@@ -202,6 +208,7 @@ class Projection:
             "global_capacity": self.global_capacity,
             "total_consumed": self.total_consumed,
             "balances": sorted(self.balance.items()),
+            "node_capacity": sorted(self.node_capacity.items()),
             "leases": sorted(
                 (
                     lid,
@@ -214,6 +221,16 @@ class Projection:
                     l["expires_at"],
                 )
                 for lid, l in self.leases.items()
+            ),
+            "plans": sorted(
+                (
+                    pid,
+                    pl["status"],
+                    pl["base_seq"],
+                    pl["last_preview_seq"],
+                    len(pl["changes"]),
+                )
+                for pid, pl in self.plans.items()
             ),
             "presence": sorted(
                 (nid, n["online"]) for nid, n in self.nodes.items()
@@ -234,6 +251,7 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
         p.bootstrapped = True
         p.global_capacity = evt["capacity"]
         p.balance[PLATFORM_ID] = evt["capacity"]
+        p.node_capacity[PLATFORM_ID] = evt["capacity"]
         if PLATFORM_ID not in p.nodes:
             p.nodes[PLATFORM_ID] = {
                 "id": PLATFORM_ID,
@@ -252,13 +270,25 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
             "online": True,
         }
         p.balance.setdefault(evt["node_id"], 0)
+        p.node_capacity.setdefault(evt["node_id"], 0)
         p.children.setdefault(evt["parent_id"], []).append(evt["node_id"])
         p.children.setdefault(evt["node_id"], [])
 
     elif t == "CapacityAdjusted":
         delta = evt["new_capacity"] - p.global_capacity
         p.global_capacity = evt["new_capacity"]
+        p.node_capacity[PLATFORM_ID] = evt["new_capacity"]
         p.balance[PLATFORM_ID] += delta
+
+    elif t == "NodeCapacityAdjusted":
+        # 显式节点容量调整：容量与余额沿父子边移动。
+        # 缩容 Δ<0：节点把 −Δ 余量退回父级；扩容 Δ>0：从父级支取 Δ。
+        # 平台节点永远走 CapacityAdjusted（全局容量入口），这里只处理子节点。
+        node_id = evt["node_id"]
+        delta = evt["new_capacity"] - p.node_capacity.get(node_id, 0)
+        p.node_capacity[node_id] = evt["new_capacity"]
+        p.balance[node_id] += delta
+        p.balance[p.nodes[node_id]["parent_id"]] -= delta
 
     elif t == "LeaseGranted":
         p.leases[evt["lease_id"]] = {
@@ -348,6 +378,39 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
 
     elif t == "ClientPresenceChanged":
         p.nodes[evt["client_id"]]["online"] = evt["online"]
+
+    # ---- 批量容量调整草案生命周期（不动余额；余额只随发布产生的
+    #      NodeCapacityAdjusted 业务事件移动） ----
+
+    elif t == "CapacityPlanCreated":
+        p.plans[evt["plan_id"]] = {
+            "id": evt["plan_id"],
+            "status": "draft",
+            "changes": [dict(c) for c in evt["changes"]],
+            "base_seq": evt["base_seq"],
+            "last_preview_seq": None,
+            "last_preview_at": None,
+            "created_at": evt["created_at"],
+            "published_at": None,
+            "discarded_at": None,
+            "business_event_count": 0,
+        }
+
+    elif t == "CapacityPlanPreviewed":
+        plan = p.plans[evt["plan_id"]]
+        plan["last_preview_seq"] = evt["preview_seq"]
+        plan["last_preview_at"] = evt["previewed_at"]
+
+    elif t == "CapacityPlanPublished":
+        plan = p.plans[evt["plan_id"]]
+        plan["status"] = "published"
+        plan["published_at"] = evt["published_at"]
+        plan["business_event_count"] = evt["event_count"]
+
+    elif t == "CapacityPlanDiscarded":
+        plan = p.plans[evt["plan_id"]]
+        plan["status"] = "discarded"
+        plan["discarded_at"] = evt["discarded_at"]
 
     else:
         raise ValidationError(f"未知事件类型: {t}")
@@ -838,4 +901,19 @@ RESULT_EXTRACTORS = {
         "client_id": pl["client_id"],
         "online": pl["online"],
     },
+    "NodeCapacityAdjusted": lambda pl: {
+        "node_id": pl["node_id"],
+        "old_capacity": pl["old_capacity"],
+        "new_capacity": pl["new_capacity"],
+    },
+    "CapacityPlanCreated": lambda pl: {"plan_id": pl["plan_id"], "base_seq": pl["base_seq"]},
+    "CapacityPlanPreviewed": lambda pl: {
+        "plan_id": pl["plan_id"],
+        "preview_seq": pl["preview_seq"],
+    },
+    "CapacityPlanPublished": lambda pl: {
+        "plan_id": pl["plan_id"],
+        "business_event_count": pl["event_count"],
+    },
+    "CapacityPlanDiscarded": lambda pl: {"plan_id": pl["plan_id"]},
 }

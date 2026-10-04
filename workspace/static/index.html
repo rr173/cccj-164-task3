@@ -99,6 +99,9 @@
   .pill.revoked { background: rgba(248,113,113,.18); color: var(--err); }
   .pill.expired { background: rgba(251,191,36,.15); color: var(--warn); }
   .pill.offline { background: rgba(143,160,189,.2); color: var(--muted); }
+  .pill.draft { background: rgba(79,140,255,.15); color: var(--accent); }
+  .pill.published { background: rgba(52,211,153,.15); color: var(--ok); }
+  .pill.discarded { background: rgba(143,160,189,.2); color: var(--muted); }
   .row-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; justify-content: flex-end; }
   .row-actions input { width: 110px; padding: 5px 8px; }
   .row-actions button { padding: 5px 10px; font-size: 12px; }
@@ -129,6 +132,38 @@
   .toast-item.err { border-color: rgba(248,113,113,.5); }
   .bar { height: 6px; background: var(--panel2); border-radius: 999px; overflow: hidden; min-width: 120px; }
   .bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--purple)); }
+
+  .plan-item {
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    margin-bottom: 10px; background: var(--panel2);
+  }
+  .plan-item.published { border-color: rgba(52,211,153,.35); }
+  .plan-item.discarded { opacity: .6; }
+  .plan-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .plan-head .pid { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .plan-head .seq { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .plan-changes { margin: 8px 0; display: flex; gap: 6px; flex-wrap: wrap; }
+  .chg {
+    font-size: 12px; padding: 3px 9px; border-radius: 6px;
+    background: var(--panel); border: 1px solid var(--line); font-variant-numeric: tabular-nums;
+  }
+  .chg.bad { border-color: rgba(248,113,113,.5); color: var(--err); }
+  .chg .d-up { color: var(--ok); } .chg .d-down { color: var(--warn); }
+  .plan-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .plan-actions button { padding: 5px 12px; font-size: 12px; }
+  .preview-box { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .banner {
+    padding: 7px 12px; border-radius: 8px; font-size: 12.5px; margin: 8px 0;
+    background: rgba(251,191,36,.12); border: 1px solid rgba(251,191,36,.45); color: var(--warn);
+  }
+  .banner.ok { background: rgba(52,211,153,.1); border-color: rgba(52,211,153,.4); color: var(--ok); }
+  .banner.err { background: rgba(248,113,113,.1); border-color: rgba(248,113,113,.45); color: var(--err); }
+  .sub-h { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .8px; margin: 8px 0 4px; }
+  .mini-table { width: 100%; font-size: 12px; }
+  .mini-table th, .mini-table td { padding: 4px 6px; }
+  .plan-editor select, .plan-editor input { margin-right: 6px; }
+  .editor-row { display: flex; gap: 6px; align-items: flex-end; margin-bottom: 6px; flex-wrap: wrap; }
+  .editor-row label.f { font-size: 11px; }
 </style>
 </head>
 <body>
@@ -220,15 +255,30 @@
     </div>
   </section>
 
+  <!-- 批量容量调整草案 -->
+  <section class="card" id="sec-plans">
+    <h2>⑤ 批量容量调整草案 <em>编辑多条节点容量变更 → 预览逐层余额/受影响租约 → 原子发布；创建后账本有新授约/消费/续约/结算则必须重新预览</em></h2>
+    <div class="plan-editor">
+      <div id="plan-rows"></div>
+      <form class="inline" id="f-plan" style="margin-top:8px">
+        <button type="button" class="ghost" id="btn-add-chg">+ 增加一条变更</button>
+        <button>创建草案</button>
+        <span class="muted" style="font-size:12px">容量沿父子边移动：扩容向父级支取、缩容把余量退回父级；同一节点在草案中只能出现一次。</span>
+      </form>
+    </div>
+    <h2 style="margin-top:18px">草案列表 <em id="plan-count" style="font-style:normal"></em></h2>
+    <div id="plan-list"><p class="muted">还没有草案。</p></div>
+  </section>
+
   <div class="grid">
     <!-- 审计 -->
     <section class="card">
-      <h2>⑤ 一致性审计 <em id="audit-time"></em></h2>
+      <h2>⑥ 一致性审计 <em id="audit-time"></em></h2>
       <div id="audit"><p class="muted">点击“立即审计”或等待自动刷新。</p></div>
     </section>
     <!-- 事件账本 -->
     <section class="card">
-      <h2>⑥ 事件账本（append-only · SHA-256 哈希链）</h2>
+      <h2>⑦ 事件账本（append-only · SHA-256 哈希链）</h2>
       <pre class="log" id="event-log">加载中…</pre>
     </section>
   </div>
@@ -311,7 +361,7 @@ function renderTree(s) {
     main.appendChild(t1);
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = `入边余量 ${n.incoming_remaining} · 已授出 ${n.outgoing_granted} · 累计消费 ${n.consumed}`;
+    meta.textContent = `容量 ${n.id === "platform" ? s.global_capacity : (n.capacity || 0)} · 入边余量 ${n.incoming_remaining} · 已授出 ${n.outgoing_granted} · 累计消费 ${n.consumed}`;
     main.appendChild(meta);
     row.appendChild(main);
 
@@ -530,6 +580,248 @@ async function loadEvents() {
   } catch { /* 忽略定时刷新错误 */ }
 }
 
+// ---- 批量容量调整草案 ----
+function addPlanRow(nodeId) {
+  const wrap = $("#plan-rows");
+  const row = document.createElement("div");
+  row.className = "editor-row";
+  const sel = document.createElement("select");
+  (lastState ? lastState.nodes : []).forEach((n) => {
+    const o = document.createElement("option");
+    o.value = n.id;
+    o.textContent = n.id + " (" + TYPE_NAME[n.type] + ", 当前容量 "
+      + (n.id === "platform" ? lastState.global_capacity : (n.capacity || 0))
+      + ", 可用 " + n.available + ")";
+    sel.appendChild(o);
+  });
+  if (nodeId) sel.value = nodeId;
+  const cap = document.createElement("input");
+  cap.type = "number"; cap.min = "0"; cap.placeholder = "新容量"; cap.style.width = "120px";
+  const del = document.createElement("button");
+  del.type = "button"; del.className = "ghost"; del.textContent = "移除";
+  del.onclick = () => row.remove();
+  row.append(sel, cap, del);
+  wrap.appendChild(row);
+}
+
+function renderPreviewBox(container, pv) {
+  const box = document.createElement("div");
+  box.className = "preview-box";
+
+  const banner = document.createElement("div");
+  banner.className = "banner " + (pv.valid ? "ok" : "err");
+  banner.textContent = pv.valid
+    ? `预览通过：整批 ${pv.items.length} 项变更合法，发布后将原子写入 ${pv.items.length} 条容量事件`
+    : `预览未通过：${pv.items.filter((i) => !i.valid).length} 项不合法，发布将整批拒绝（不会有任何变更生效）`;
+  box.appendChild(banner);
+
+  if (pv.drifted_from_base) {
+    const stale = document.createElement("div");
+    stale.className = "banner";
+    const labels = (pv.intervening_changes || [])
+      .map((c) => `${c.label}×${c.count}`).join("、");
+    stale.textContent = `草案已陈旧：创建后账本发生了 ${labels || "业务变更"}（水位 ${pv.base_seq} → ${pv.current_seq}）；本次预览已基于最新账本，可直接发布。`;
+    box.appendChild(stale);
+  }
+
+  // 逐项结果
+  const h1 = document.createElement("div");
+  h1.className = "sub-h"; h1.textContent = "逐项校验";
+  box.appendChild(h1);
+  const t1 = document.createElement("table");
+  t1.className = "mini-table";
+  t1.innerHTML = "<thead><tr><th>#</th><th>节点</th><th class='num'>旧容量</th><th class='num'>新容量</th><th class='num'>Δ</th><th>结果/拒绝原因</th></tr></thead>";
+  const tb1 = document.createElement("tbody");
+  pv.items.forEach((it) => {
+    const tr = document.createElement("tr");
+    const td = (v, cls) => { const c = document.createElement("td"); if (cls) c.className = cls; c.textContent = v; return c; };
+    tr.appendChild(td(it.index + 1));
+    tr.appendChild(td(it.node_id));
+    tr.appendChild(td(it.old_capacity, "num"));
+    tr.appendChild(td(it.new_capacity, "num"));
+    const d = document.createElement("td");
+    d.className = "num";
+    d.innerHTML = it.delta === 0 ? "0"
+      : (it.delta > 0 ? `<span class="d-up">+${it.delta}</span>` : `<span class="d-down">${it.delta}</span>`);
+    tr.appendChild(d);
+    const res = document.createElement("td");
+    res.textContent = it.valid ? "✓ 合法" : "✗ " + it.reason;
+    res.style.color = it.valid ? "var(--ok)" : "var(--err)";
+    tr.appendChild(res);
+    tb1.appendChild(tr);
+  });
+  t1.appendChild(tb1);
+  box.appendChild(t1);
+
+  // 逐层余额
+  const h2 = document.createElement("div");
+  h2.className = "sub-h";
+  h2.textContent = `执行后的逐层余额（全局容量 ${pv.global_capacity_before} → ${pv.global_capacity_after}）`;
+  box.appendChild(h2);
+  const t2 = document.createElement("table");
+  t2.className = "mini-table";
+  t2.innerHTML = "<thead><tr><th>层级节点</th><th class='num'>容量 前→后</th><th class='num'>余额 前→后</th></tr></thead>";
+  const tb2 = document.createElement("tbody");
+  pv.layer_balances.forEach((lb) => {
+    const tr = document.createElement("tr");
+    if (!lb.touched) tr.style.opacity = ".55";
+    const td = (v, cls) => { const c = document.createElement("td"); if (cls) c.className = cls; c.innerHTML = v; return c; };
+    tr.appendChild(td(`${TYPE_NAME[lb.node_type] || lb.node_type} · ${lb.node_id}` + (lb.touched ? "" : "（不变，仅展示层级链）")));
+    tr.appendChild(td(`${lb.capacity_before} → <b>${lb.capacity_after}</b>`, "num"));
+    const changed = lb.before !== lb.after;
+    tr.appendChild(td(`${lb.before} → <b style="color:${changed ? "var(--accent)" : "inherit"}">${lb.after}</b>`, "num"));
+    tb2.appendChild(tr);
+  });
+  t2.appendChild(tb2);
+  box.appendChild(t2);
+
+  // 受影响租约
+  const h3 = document.createElement("div");
+  h3.className = "sub-h";
+  h3.textContent = `受影响租约（${pv.affected_leases.length} 条未结算边）`;
+  box.appendChild(h3);
+  if (!pv.affected_leases.length) {
+    box.appendChild(document.createTextNode("无"));
+  } else {
+    const t3 = document.createElement("table");
+    t3.className = "mini-table";
+    t3.innerHTML = "<thead><tr><th>租约</th><th>父 → 子</th><th>角色</th><th class='num'>授予/消费/剩余</th><th>状态</th></tr></thead>";
+    const tb3 = document.createElement("tbody");
+    pv.affected_leases.forEach((a) => {
+      const tr = document.createElement("tr");
+      const td = (v, cls) => { const c = document.createElement("td"); if (cls) c.className = cls; c.textContent = v; return c; };
+      tr.appendChild(td(a.lease_id));
+      tr.appendChild(td(`${a.lessor_id} → ${a.holder_id}`));
+      tr.appendChild(td(a.affected_role));
+      tr.appendChild(td(`${a.amount} / ${a.consumed} / ${a.remaining}`, "num"));
+      tr.appendChild(td(a.status === "active" ? "活动" : "到期挂起"));
+      tb3.appendChild(tr);
+    });
+    t3.appendChild(tb3);
+    box.appendChild(t3);
+  }
+  container.appendChild(box);
+}
+
+async function renderPlans() {
+  const box = $("#plan-list");
+  box.innerHTML = "";
+  let data = { plans: [] };
+  try { data = await api("/api/capacity-plans"); } catch { return; }
+  $("#plan-count").textContent = data.count ? `共 ${data.count} 份` : "";
+  if (!data.plans.length) {
+    box.innerHTML = '<p class="muted">还没有草案。</p>';
+    return;
+  }
+  data.plans.slice().reverse().forEach((pl) => {
+    const card = document.createElement("div");
+    card.className = "plan-item " + pl.status;
+
+    const head = document.createElement("div");
+    head.className = "plan-head";
+    const id = document.createElement("span");
+    id.className = "pid"; id.textContent = pl.plan_id;
+    head.appendChild(id);
+    const pill = document.createElement("span");
+    pill.className = "pill " + pl.status;
+    pill.textContent = { draft: "草案", published: "已发布", discarded: "已废弃" }[pl.status];
+    head.appendChild(pill);
+    const seq = document.createElement("span");
+    seq.className = "seq";
+    seq.textContent = `创建水位 #${pl.base_seq}` + (pl.last_preview_seq !== null
+      ? ` · 最后预览水位 #${pl.last_preview_seq}` : " · 未预览");
+    head.appendChild(seq);
+    card.appendChild(head);
+
+    const changes = document.createElement("div");
+    changes.className = "plan-changes";
+    pl.changes.forEach((ch) => {
+      const tag = document.createElement("span");
+      tag.className = "chg";
+      tag.innerHTML = `${ch.node_id} → 容量 ${ch.capacity}`;
+      changes.appendChild(tag);
+    });
+    card.appendChild(changes);
+
+    const storedPv = pl.status === "published"
+      ? (pl.publish_result || null)
+      : (pl.last_preview || null);
+    if (storedPv) renderPreviewBox(card, storedPv);
+
+    if (pl.status === "published" && pl.publish_result) {
+      const note = document.createElement("div");
+      note.className = "muted";
+      note.style.fontSize = "12px";
+      note.style.marginTop = "6px";
+      note.textContent = `已于水位 #${pl.last_preview_seq} 原子发布 ${pl.publish_result.applied_count} 项变更；重复发布只会返回此首次结果。`;
+      card.appendChild(note);
+    }
+
+    if (pl.status === "draft") {
+      const acts = document.createElement("div");
+      acts.className = "plan-actions";
+      const pvBtn = document.createElement("button");
+      pvBtn.className = "warn"; pvBtn.textContent = "预览";
+      pvBtn.onclick = async () => {
+        try { const pv = await api("/api/capacity-plans/preview", { plan_id: pl.plan_id });
+          toast(pv.valid ? "预览通过，可以发布" : "预览发现不合法项，发布将被整批拒绝", pv.valid);
+          renderPlans();
+        } catch (e) { toast(e.message, false); }
+      };
+      acts.appendChild(pvBtn);
+      const pubBtn = document.createElement("button");
+      pubBtn.textContent = "发布";
+      pubBtn.onclick = async () => {
+        try {
+          const r = await api("/api/capacity-plans/publish", { plan_id: pl.plan_id });
+          if (r.replayed) toast("该草案已发布，返回首次发布结果", false);
+          else toast(`已原子发布 ${r.applied_count} 项容量变更`);
+          renderPlans(); refreshState(); loadEvents(); runAudit(true);
+        } catch (e) {
+          if (e.details && e.details.intervening_changes)
+            toast(e.message + "（已陈旧，请先重新预览）", false);
+          else toast(e.message, false);
+        }
+      };
+      acts.appendChild(pubBtn);
+      const disBtn = document.createElement("button");
+      disBtn.className = "danger"; disBtn.textContent = "废弃";
+      disBtn.onclick = async () => {
+        try { await api("/api/capacity-plans/discard", { plan_id: pl.plan_id });
+          toast("草案已废弃"); renderPlans();
+        } catch (e) { toast(e.message, false); }
+      };
+      acts.appendChild(disBtn);
+      card.appendChild(acts);
+    }
+    box.appendChild(card);
+  });
+}
+
+function bindPlanForm() {
+  addPlanRow(); addPlanRow();
+  $("#btn-add-chg").onclick = () => addPlanRow();
+  $("#f-plan").onsubmit = async (e) => {
+    e.preventDefault();
+    const changes = [];
+    [...$("#plan-rows").children].forEach((row) => {
+      const node_id = row.querySelector("select").value;
+      const raw = row.querySelector("input").value;
+      if (raw.trim() === "") return;
+      changes.push({ node_id, capacity: parseInt(raw, 10) });
+    });
+    if (!changes.length) return toast("请至少填写一条节点容量变更", false);
+    try {
+      const r = await api("/api/capacity-plans",
+        { changes, command_id: uid("plan-create") });
+      $("#plan-rows").innerHTML = "";
+      addPlanRow(); addPlanRow();
+      toast(`草案 ${r.plan_id} 已创建（账本位置 #${r.base_seq}），请预览后发布`);
+      renderPlans();
+    } catch (err) { toast(err.message, false); }
+  };
+}
+
 // ---- 表单绑定 ----
 function bindForms() {
   $("#f-bootstrap").onsubmit = async (e) => {
@@ -578,6 +870,7 @@ async function refreshState() {
     renderTree(s);
     renderForms(s);
     renderLeases(s);
+    $("#sec-plans").style.display = s.bootstrapped ? "" : "none";
   } catch { /* 网络抖动时保留旧画面 */ }
 }
 
@@ -585,12 +878,14 @@ async function refreshAll() {
   await refreshState();
   await loadEvents();
   await runAudit(true);
+  await renderPlans();
 }
 
 bindForms();
+bindPlanForm();
 refreshAll();
 setInterval(() => { if ($("#auto").checked) refreshState(); }, 2000);
-setInterval(() => { if ($("#auto").checked) { loadEvents(); runAudit(true); } }, 5000);
+setInterval(() => { if ($("#auto").checked) { loadEvents(); runAudit(true); renderPlans(); } }, 5000);
 </script>
 </body>
 </html>

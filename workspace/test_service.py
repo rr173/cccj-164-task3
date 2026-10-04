@@ -729,6 +729,376 @@ def test_lease_amend(srv: Server):
     check("不带修订号的归还仍成功（向后兼容）", code == 201, f"code={code}")
 
 
+def test_capacity_plans(srv: Server):
+    print("\n[12] 批量容量调整草案（预览/原子发布/陈旧拒绝/废弃/幂等/重启）")
+    c = srv.client
+    c.post("/api/capacity", {"capacity": 1000})
+    c.post("/api/nodes", {"type": "organization", "parent_id": "platform", "node_id": "org-q"})
+    c.post("/api/nodes", {"type": "project", "parent_id": "org-q", "node_id": "proj-q"})
+    c.post("/api/nodes", {"type": "client", "parent_id": "proj-q", "node_id": "cli-q"})
+
+    # 自举隔离子树：把平台当前可用（动态读取，规避共享账本前序残留）
+    # 以“节点容量扩容”整笔发给 org-q；此后平台可用 0，子树自成一池。
+    plat_room = c.get("/api/state")[1]["nodes"][0]["available"]
+    c.post("/api/capacity-plans", {"plan_id": "PL-boot",
+                                   "changes": [{"node_id": "org-q", "capacity": plat_room}]})
+    c.post("/api/capacity-plans/preview", {"plan_id": "PL-boot"})
+    rc, _ = c.post("/api/capacity-plans/publish", {"plan_id": "PL-boot"})
+    assert rc == 201, f"自举草案发布失败 {rc}"
+    ORG_CAP = plat_room                      # org-q 容量与初始余额
+    c.post("/api/leases", {"lessor_id": "org-q", "holder_id": "proj-q", "amount": 300, "lease_id": "Lq-proj"})
+    c.post("/api/leases", {"lessor_id": "proj-q", "holder_id": "cli-q", "amount": 200, "lease_id": "Lq-cli"})
+    # 余额：platform=0  org=ORG_CAP-300(>=200)  proj=100  cli=200
+    st0 = c.get("/api/state")[1]
+    bal0 = {n["id"]: n["available"] for n in st0["nodes"]}
+    assert bal0["platform"] == 0 and bal0["proj-q"] == 100 and bal0["cli-q"] == 200, bal0
+    assert bal0["org-q"] >= 200, bal0
+
+    # ---- 结构校验 ----
+    code, _ = c.post("/api/capacity-plans", {"changes": []})
+    check("空变更清单 → 400", code == 400, f"code={code}")
+    code, _ = c.post("/api/capacity-plans", {"changes": "not-a-list"})
+    check("changes 非数组 → 400", code == 400, f"code={code}")
+    code, _ = c.post("/api/capacity-plans", {"changes": [{"node_id": "nope", "capacity": 1}]})
+    check("草案引用不存在节点 → 404", code == 404, f"code={code}")
+    code, _ = c.post("/api/capacity-plans",
+                     {"changes": [{"node_id": "org-q", "capacity": 10},
+                                  {"node_id": "org-q", "capacity": 20}]})
+    check("同一草案中重复节点 → 400", code == 400, f"code={code}")
+    code, _ = c.post("/api/capacity-plans", {"plan_id": "PL-x", "changes": [{"node_id": "org-q", "capacity": 1}],
+                                             "command_id": "cmd-plx-1"})
+    code, _ = c.post("/api/capacity-plans", {"plan_id": "PL-x", "changes": [{"node_id": "org-q", "capacity": 1}],
+                                             "command_id": "cmd-plx-2"})
+    check("重复 plan_id → 409", code == 409, f"code={code}")
+    # 创建命令的幂等：相同 command_id 重试只返回同一草案
+    r1 = c.post("/api/capacity-plans", {"plan_id": "PL-idem", "changes": [{"node_id": "org-q", "capacity": ORG_CAP}],
+                                        "command_id": "cmd-plan-idem"})
+    r2 = c.post("/api/capacity-plans", {"plan_id": "PL-idem", "changes": [{"node_id": "org-q", "capacity": ORG_CAP}],
+                                        "command_id": "cmd-plan-idem"})
+    check("相同 command_id 的创建重试幂等（200 重放同一 plan_id）",
+          r1[0] == 201 and r2[0] == 200 and r2[1].get("replayed") is True, f"{r1[0]}/{r2[0]}")
+
+    # ---- 创建草案：proj 容量 0→50（org 出资 50）----
+    code, pl = c.post("/api/capacity-plans", {
+        "plan_id": "PL-happy",
+        "changes": [{"node_id": "proj-q", "capacity": 50}],
+        "command_id": "cmd-plan-happy",
+    })
+    check("创建草案", code == 201 and pl["status"] == "draft" and pl["base_seq"] > 0, f"{code} {pl}")
+    base_seq = pl["base_seq"]
+
+    code, _ = c.post("/api/capacity-plans/publish", {"plan_id": "PL-happy"})
+    check("未预览就发布 → 409", code == 409, f"code={code}")
+
+    # ---- 预览：逐层余额 + 受影响租约 ----
+    code, pv = c.post("/api/capacity-plans/preview", {"plan_id": "PL-happy"})
+    check("预览 200 且整批合法 fresh=True", code == 200 and pv["valid"] is True
+          and pv["fresh"] is True and pv["drifted_from_base"] is False, f"{code} {pv.get('valid')}")
+    lb = {x["node_id"]: x for x in pv["layer_balances"]}
+    check("预览逐层余额 org-q −50",
+          lb["org-q"]["before"] == bal0["org-q"] and lb["org-q"]["after"] == bal0["org-q"] - 50
+          and lb["org-q"]["capacity_before"] == ORG_CAP and lb["org-q"]["capacity_after"] == ORG_CAP,
+          str(lb["org-q"]))
+    check("预览逐层余额 proj-q +50，容量 0→50",
+          lb["proj-q"]["before"] == 100 and lb["proj-q"]["after"] == 150
+          and lb["proj-q"]["capacity_after"] == 50, str(lb["proj-q"]))
+    check("层级链只含变更节点的祖先（不包含无关的 cli-q）", "cli-q" not in lb)
+    aff = {a["lease_id"]: a for a in pv["affected_leases"]}
+    check("受影响租约 Lq-proj 角色=出租方/持有方",
+          aff["Lq-proj"]["affected_role"] == "出租方/持有方", str(list(aff)))
+    check("受影响租约 Lq-cli 角色=出租方（proj 是其出租方）",
+          aff["Lq-cli"]["affected_role"] == "出租方", str(list(aff)))
+    check("受影响租约带回余额前/后快照",
+          aff["Lq-proj"]["holder_balance_before"] == 100 and aff["Lq-proj"]["holder_balance_after"] == 150)
+    check("预览不改变实际余额", c.get("/api/state")[1]["nodes"][0]["available"] == 0)
+
+    # ---- 发布：原子批次 ----
+    code, pub = c.post("/api/capacity-plans/publish", {"plan_id": "PL-happy", "command_id": "cmd-plan-pub"})
+    check("发布成功", code == 201 and pub["status"] == "published" and pub["applied_count"] == 1, f"{code} {pub}")
+    st = c.get("/api/state")[1]
+    bal = {n["id"]: n["available"] for n in st["nodes"]}
+    cap = {n["id"]: n["capacity"] for n in st["nodes"]}
+    check("发布后余额与预览一致（org-50 / proj+50）",
+          bal["org-q"] == bal0["org-q"] - 50 and bal["proj-q"] == 150, str(bal))
+    check("节点容量已记录 proj=50 org=ORG_CAP",
+          cap["proj-q"] == 50 and cap["org-q"] == ORG_CAP, str(cap))
+    check("全局守恒仍成立", st["total_available"] + st["total_consumed"] == st["global_capacity"])
+    evts = c.get("/api/events")[1]["events"]
+    check("NodeCapacityAdjusted 业务事件入链（含自举 2 条）",
+          len([e for e in evts if e["event_type"] == "NodeCapacityAdjusted"]) == 2)
+    check("草案生命周期事件全部入哈希链（Created/Previewed/Published）",
+          all(any(e["event_type"] == t for e in evts)
+              for t in ("CapacityPlanCreated", "CapacityPlanPreviewed", "CapacityPlanPublished")))
+
+    # 重复发布 → 只返回首次发布结果
+    code, pub2 = c.post("/api/capacity-plans/publish", {"plan_id": "PL-happy", "command_id": "cmd-plan-pub"})
+    check("同命令重复发布 → 200 重放首次结果", code == 200 and pub2.get("replayed") is True and pub2["applied_count"] == 1, f"{code}")
+    code, pub3 = c.post("/api/capacity-plans/publish", {"plan_id": "PL-happy", "command_id": "cmd-plan-pub-other"})
+    check("换新命令重复发布也只得到首次结果", code == 200 and pub3.get("replayed") is True, f"{code}")
+    code, _ = c.post("/api/capacity-plans/discard", {"plan_id": "PL-happy"})
+    check("已发布草案不能废弃 → 409", code == 409, f"code={code}")
+
+    # ---- 任一项不合法：整批不生效 ----
+    # org 当前余 = ORG_CAP-350（>=150）。合法项：org 小幅缩容 1（容量 ORG_CAP→ORG_CAP-1，
+    # 只需退 1，余额充足）；非法项：proj 扩容到 99999（org 出不起）。
+    snap = {n["id"]: (n["available"], n["capacity"]) for n in c.get("/api/state")[1]["nodes"]}
+    code, _ = c.post("/api/capacity-plans", {"plan_id": "PL-bad", "changes": [
+        {"node_id": "org-q", "capacity": ORG_CAP - 1},
+        {"node_id": "proj-q", "capacity": 99999},
+    ]})
+    assert code == 201
+    code, pvb = c.post("/api/capacity-plans/preview", {"plan_id": "PL-bad"})
+    invalids = [i for i in pvb["items"] if not i["valid"]]
+    check("预览逐项给出拒绝原因（org 合法、proj 非法）",
+          pvb["valid"] is False and [i["node_id"] for i in invalids] == ["proj-q"]
+          and "扩容被拒绝" in invalids[0]["reason"], str(pvb["items"]))
+    code, err = c.post("/api/capacity-plans/publish", {"plan_id": "PL-bad"})
+    check("发布非法草案 → 409 且回传 rejected_items（整批不生效）",
+          code == 409 and len(err["details"]["rejected_items"]) == 1, f"{code}")
+    after = {n["id"]: (n["available"], n["capacity"]) for n in c.get("/api/state")[1]["nodes"]}
+    check("整批回滚：合法项也未生效，余额/容量逐节点不变", after == snap, f"{snap} -> {after}")
+
+    # ---- 合法缩容 + 非法扩容 混合批 ----
+    code, _ = c.post("/api/capacity-plans", {"plan_id": "PL-shrink", "changes": [
+        {"node_id": "proj-q", "capacity": 0},       # 退 50：proj 余 150 充足 → 合法
+        {"node_id": "org-q", "capacity": 9_000_000},  # 平台可用 0，出不起 → 非法
+    ]})
+    code, pvs = c.post("/api/capacity-plans/preview", {"plan_id": "PL-shrink"})
+    reasons = {i["node_id"]: (i["valid"], i["reason"]) for i in pvs["items"]}
+    check("proj 缩容 50→0 合法（余 150 足以让出 50）", reasons["proj-q"][0] is True, str(reasons))
+    check("org 扩容（父级平台出不起）非法", reasons["org-q"][0] is False and "扩容被拒绝" in reasons["org-q"][1], str(reasons))
+    code, _ = c.post("/api/capacity-plans/publish", {"plan_id": "PL-shrink"})
+    check("混合批发布 → 409，proj 未被缩容（容量仍 50）",
+          code == 409 and next(n["capacity"] for n in c.get("/api/state")[1]["nodes"] if n["id"] == "proj-q") == 50,
+          f"code={code}")
+
+    # 纯合法缩容批：proj 50→0（退 50 给 org）
+    code, _ = c.post("/api/capacity-plans", {"plan_id": "PL-shrink-ok",
+                                             "changes": [{"node_id": "proj-q", "capacity": 0}]})
+    code, pvsk = c.post("/api/capacity-plans/preview", {"plan_id": "PL-shrink-ok"})
+    check("纯缩容批预览合法 delta=-50", pvsk["valid"] is True and pvsk["items"][0]["delta"] == -50, str(pvsk))
+    code, _ = c.post("/api/capacity-plans/publish", {"plan_id": "PL-shrink-ok"})
+    check("纯缩容批发布成功", code == 201, f"code={code}")
+    st = c.get("/api/state")[1]
+    pnode, onode = (next(n for n in st["nodes"] if n["id"] == x) for x in ("proj-q", "org-q"))
+    check("proj 容量归零、余额退回 50（150→100）非负", pnode["capacity"] == 0 and pnode["available"] == 100, str(pnode))
+    check("org 收回 50", onode["available"] == bal0["org-q"], str(onode))
+    check("缩容后全局守恒", st["total_available"] + st["total_consumed"] == st["global_capacity"])
+
+    # 容量无变化的条目拒绝
+    c.post("/api/capacity-plans", {"plan_id": "PL-noop", "changes": [{"node_id": "cli-q", "capacity": 0}]})
+    code, pvd = c.post("/api/capacity-plans/preview", {"plan_id": "PL-noop"})
+    check("容量未变化的条目 → 非法", pvd["valid"] is False and "未变化" in pvd["items"][0]["reason"])
+    code, _ = c.post("/api/capacity-plans/publish", {"plan_id": "PL-noop"})
+    check("含无变化条目的批次不能发布 → 409", code == 409, f"code={code}")
+
+    # ---- 陈旧版本 ----
+    # 恢复 proj 容量 50
+    c.post("/api/capacity-plans", {"plan_id": "PL-restore",
+                                   "changes": [{"node_id": "proj-q", "capacity": 50}]})
+    c.post("/api/capacity-plans/preview", {"plan_id": "PL-restore"})
+    c.post("/api/capacity-plans/publish", {"plan_id": "PL-restore"})
+    # 此时 org 余 = bal0(org)，proj 余 = 150
+
+    c.post("/api/capacity-plans", {"plan_id": "PL-stale",
+                                   "changes": [{"node_id": "proj-q", "capacity": 20}]})
+    c.post("/api/capacity-plans/preview", {"plan_id": "PL-stale"})
+    # 创建后又授约（org 余 >=200，必有 10 可用）
+    code, _ = c.post("/api/leases", {"lessor_id": "org-q", "holder_id": "proj-q",
+                                     "amount": 10, "lease_id": "Lq-new"})
+    check("创建草案后又授约", code == 201, f"code={code}")
+    code, err = c.post("/api/capacity-plans/publish", {"plan_id": "PL-stale"})
+    check("陈旧草案发布 → 409", code == 409, f"code={code}")
+    check("拒绝详情指出需要重新预览，intervening 含授约",
+          err["details"]["current_seq"] > err["details"]["preview_seq"]
+          and any(x["event_type"] == "LeaseGranted" for x in err["details"]["intervening_changes"])
+          and "重新预览" in err["details"]["hint"], str(err.get("details")))
+
+    # 重新预览后又消费 → 再次陈旧
+    code, pvy = c.post("/api/capacity-plans/preview", {"plan_id": "PL-stale"})
+    check("重新预览成功（drifted_from_base=True）",
+          code == 200 and pvy["fresh"] is True and pvy["drifted_from_base"] is True)
+    c.post("/api/leases/usage", {"lease_id": "Lq-cli", "amount": 5, "usage_event_id": "evt-plan-1"})
+    code, err = c.post("/api/capacity-plans/publish", {"plan_id": "PL-stale"})
+    check("预览后又消费 → 409（归因 UsageRecorded）",
+          code == 409 and any(x["event_type"] == "UsageRecorded" for x in err["details"]["intervening_changes"]),
+          f"{code}")
+
+    # 重新预览后结算归还 → 又陈旧
+    c.post("/api/capacity-plans/preview", {"plan_id": "PL-stale"})
+    c.post("/api/leases/release", {"lease_id": "Lq-new"})
+    code, err = c.post("/api/capacity-plans/publish", {"plan_id": "PL-stale"})
+    check("预览后又结算归还 → 409（归因 LeaseClosed）",
+          code == 409 and any(x["event_type"] == "LeaseClosed" for x in err["details"]["intervening_changes"]),
+          f"{code}")
+
+    # 其他草案的生命周期不推进业务水位：重新预览后即可发布
+    c.post("/api/capacity-plans", {"plan_id": "PL-other", "changes": [{"node_id": "proj-q", "capacity": 10}]})
+    c.post("/api/capacity-plans/preview", {"plan_id": "PL-other"})
+    c.post("/api/capacity-plans/discard", {"plan_id": "PL-other"})
+    code, pvf = c.post("/api/capacity-plans/preview", {"plan_id": "PL-stale"})
+    # 消费 5 沿链传播：proj 容量 50→20 要退 30，proj 余 = 100+10+50-5+10(release)-? 直接以预览结果为准
+    check("对最新账本重新预览（合法与否以当前余额判定）", code == 200, str(pvf.get("items")))
+    if pvf["valid"]:
+        code, pubx = c.post("/api/capacity-plans/publish", {"plan_id": "PL-stale"})
+        check("其他草案不推进水位：重新预览后发布成功", code == 201 and pubx["status"] == "published", f"{code}")
+        stale_published = True
+    else:
+        # proj 余量不足以退 30 时改发布一个更小的缩容，验证陈旧闸门已解除
+        c.post("/api/capacity-plans", {"plan_id": "PL-stale2",
+                                       "changes": [{"node_id": "proj-q", "capacity": 45}]})
+        c.post("/api/capacity-plans/preview", {"plan_id": "PL-stale2"})
+        code, _ = c.post("/api/capacity-plans/publish", {"plan_id": "PL-stale2"})
+        check("陈旧闸门解除后小步缩容可发布", code == 201, f"code={code} {pvf['items']}")
+        stale_published = False
+
+    # 续约（LeaseAmended）推进水位
+    c.post("/api/leases", {"lessor_id": "proj-q", "holder_id": "cli-q",
+                           "amount": 5, "lease_id": "Lq-ttl", "ttl_seconds": 3600})
+    c.post("/api/capacity-plans", {"plan_id": "PL-amend",
+                                   "changes": [{"node_id": "proj-q", "capacity": 50 if stale_published else 40}]})
+    c.post("/api/capacity-plans/preview", {"plan_id": "PL-amend"})
+    c.post("/api/leases/amend", {"lease_id": "Lq-ttl", "expected_revision": 0, "extend_seconds": 600})
+    code, err = c.post("/api/capacity-plans/publish", {"plan_id": "PL-amend"})
+    check("预览后发生续约 → 409（归因 LeaseAmended）",
+          code == 409 and any(x["event_type"] == "LeaseAmended" for x in err["details"]["intervening_changes"]),
+          f"{code}")
+    code, pva = c.post("/api/capacity-plans/preview", {"plan_id": "PL-amend"})
+    code, puba = c.post("/api/capacity-plans/publish", {"plan_id": "PL-amend"})
+    check("续约后重新预览可发布", code == 201 and puba["status"] == "published", f"{code} {pva.get('items')}")
+
+    # 到期结算（后台 sweep 系统事件）也推进水位
+    c.post("/api/leases", {"lessor_id": "proj-q", "holder_id": "cli-q",
+                           "amount": 1, "lease_id": "Lq-soon", "ttl_seconds": 1})
+    # 选一个对当前状态合法的 proj 容量目标（只扩 1，org 出资）
+    c.post("/api/capacity-plans", {"plan_id": "PL-exp",
+                                   "changes": [{"node_id": "proj-q",
+                                                "capacity": next(n["capacity"] for n in c.get("/api/state")[1]["nodes"] if n["id"] == "proj-q") + 1}]})
+    code, pve = c.post("/api/capacity-plans/preview", {"plan_id": "PL-exp"})
+    check("到期测试草案预览合法", code == 200 and pve["valid"], str(pve.get("items")))
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if {x["id"]: x for x in c.get("/api/state")[1]["leases"]}["Lq-soon"]["status"] == "closed":
+            break
+        time.sleep(0.15)
+    check("短 TTL 租约已被 sweep 到期结算",
+          {x["id"]: x for x in c.get("/api/state")[1]["leases"]}["Lq-soon"]["status"] == "closed")
+    code, err = c.post("/api/capacity-plans/publish", {"plan_id": "PL-exp"})
+    check("预览后发生到期结算 → 409（系统事件同样推进业务水位）",
+          code == 409 and any(x["event_type"] in ("LeaseExpired", "LeaseClosed")
+                              for x in err["details"]["intervening_changes"]), f"{code}")
+    c.post("/api/capacity-plans/discard", {"plan_id": "PL-exp"})
+
+    # 已发布草案再预览 → 409 回传发布结果
+    code, err = c.post("/api/capacity-plans/preview", {"plan_id": "PL-happy"})
+    check("已发布草案再预览 → 409 且回传发布结果",
+          code == 409 and err["details"]["status"] == "published", f"{code}")
+
+    # ---- 废弃 ----
+    code, d = c.post("/api/capacity-plans/discard", {"plan_id": "PL-bad", "command_id": "cmd-disc-bad"})
+    check("废弃草案", code == 201 and d["status"] == "discarded", f"{code} {d}")
+    code, _ = c.post("/api/capacity-plans/publish", {"plan_id": "PL-bad"})
+    check("废弃草案发布 → 409", code == 409, f"code={code}")
+    code, d2 = c.post("/api/capacity-plans/discard", {"plan_id": "PL-bad", "command_id": "cmd-disc-bad"})
+    check("重复废弃幂等 → 200", code == 200 and d2.get("replayed") is True, f"{code}")
+    code, _ = c.post("/api/capacity-plans/discard", {"plan_id": "PL-ghost"})
+    check("废弃不存在草案 → 404", code == 404, f"code={code}")
+
+    # 列表 / 详情
+    code, lst = c.get("/api/capacity-plans")
+    statuses = {p["plan_id"]: p["status"] for p in lst["plans"]}
+    check("草案列表状态正确",
+          code == 200 and statuses.get("PL-happy") == "published"
+          and statuses.get("PL-bad") == "discarded"
+          and statuses.get("PL-other") == "discarded"
+          and statuses.get("PL-exp") == "discarded", str(statuses))
+    code, detail = c.get("/api/capacity-plans/PL-happy")
+    check("草案详情含首次发布结果、变更清单、创建水位",
+          code == 200 and detail["publish_result"]["applied_count"] == 1
+          and detail["changes"] == [{"node_id": "proj-q", "capacity": 50}]
+          and detail["base_seq"] == base_seq, f"{code}")
+    code, _ = c.get("/api/capacity-plans/PL-ghost")
+    check("查询不存在草案 → 404", code == 404, f"code={code}")
+    ok, failed = audit_ok(c)
+    check("草案场景审计通过（含 capacity_plan_consistency）", ok, str(failed))
+
+    # ---- 重启后草案、发布结果、审计轨迹全部可查 ----
+    srv.restart()
+    code, lst2 = c.get("/api/capacity-plans")
+    st2 = {p["plan_id"]: p["status"] for p in lst2["plans"]}
+    check("重启后草案状态全部恢复",
+          st2.get("PL-happy") == "published" and st2.get("PL-bad") == "discarded"
+          and st2.get("PL-other") == "discarded" and st2.get("PL-amend") == "published",
+          str(st2))
+    happy = next(p for p in lst2["plans"] if p["plan_id"] == "PL-happy")
+    check("重启后首次发布结果可查",
+          happy["publish_result"]["status"] == "published"
+          and happy["publish_result"]["layer_balances"] is not None)
+    check("重启后最后预览快照可查（逐层余额/受影响租约）",
+          happy["last_preview"] is not None
+          and {x["node_id"] for x in happy["last_preview"]["layer_balances"]} == {"platform", "org-q", "proj-q"}
+          and len(happy["last_preview"]["affected_leases"]) == 2,
+          str(happy.get("last_preview", {}).keys()) if happy["last_preview"] else "None")
+    check("重启后 base_seq 恢复", happy["base_seq"] == base_seq)
+    code, rr = c.post("/api/capacity-plans/publish", {"plan_id": "PL-happy", "command_id": "cmd-plan-pub"})
+    check("重启后重复发布 → 200 重放首次结果", code == 200 and rr.get("replayed") is True, f"{code}")
+    evts_after = c.get("/api/events")[1]["events"]
+    check("重启后草案生命周期审计轨迹仍在账本",
+          all(any(e["event_type"] == t for e in evts_after)
+              for t in ("CapacityPlanCreated", "CapacityPlanPreviewed",
+                        "CapacityPlanPublished", "CapacityPlanDiscarded")))
+    st = c.get("/api/state")[1]
+    check("重启后节点容量与余额从事件重放恢复且非负",
+          all(n["available"] >= 0 for n in st["nodes"])
+          and next(n["capacity"] for n in st["nodes"] if n["id"] == "proj-q")
+              == (50 if stale_published else 40))
+    ok, failed = audit_ok(c)
+    check("重启后审计通过（哈希链 + 重放等价 + 草案一致性）", ok, str(failed))
+
+    # ---- 并发：两份草案争抢同一容量池，串行化保证至多一份生效 ----
+    c.post("/api/nodes", {"type": "organization", "parent_id": "platform", "node_id": "org-cc"})
+    # 平台可用为 0；容量池用 org-q 当前可用。两份草案都要把 proj 容量提到
+    # “恰好抽干 org 池”，先到者成功、后到者因陈旧或超卖失败。
+    st = c.get("/api/state")[1]
+    proj_cur = next(n["capacity"] for n in st["nodes"] if n["id"] == "proj-q")
+    org_pool = next(n["available"] for n in st["nodes"] if n["id"] == "org-q")
+    target = proj_cur + org_pool
+    for pid in ("PL-c1", "PL-c2"):
+        rc = c.post("/api/capacity-plans", {"plan_id": pid,
+                                            "changes": [{"node_id": "proj-q", "capacity": target}]})[0]
+        rc, pv = c.post("/api/capacity-plans/preview", {"plan_id": pid})
+        assert rc == 200 and pv["valid"], (pid, pv.get("items"))
+    results = []
+    lock = threading.Lock()
+
+    def pub_worker(pid, cid):
+        cd, body = srv.client.post("/api/capacity-plans/publish",
+                                   {"plan_id": pid, "command_id": cid})
+        with lock:
+            results.append((pid, cd, body))
+
+    threads = [
+        threading.Thread(target=pub_worker, args=("PL-c1", "cmd-cc-1")),
+        threading.Thread(target=pub_worker, args=("PL-c2", "cmd-cc-2")),
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    codes = sorted(cd for _, cd, _ in results)
+    check("并发发布互斥：恰好一份 201、一份 409", codes == [201, 409], str(results))
+    loser = next(pid for pid, cd, _ in results if cd == 409)
+    st = c.get("/api/state")[1]
+    check("并发后所有余额非负、全局守恒",
+          all(n["available"] >= 0 for n in st["nodes"])
+          and st["total_available"] + st["total_consumed"] == st["global_capacity"])
+    pnode = next(n for n in st["nodes"] if n["id"] == "proj-q")
+    check("赢方整笔生效（proj 容量到目标值）", pnode["capacity"] == target, str(pnode))
+    code, pv = c.post("/api/capacity-plans/preview", {"plan_id": loser})
+    check("输家重新预览看到当前现实（超卖或陈旧后的拒绝原因）",
+          code == 200 and pv["valid"] is False and pv["items"][0]["reason"], str(pv.get("items")))
+    ok, failed = audit_ok(c)
+    check("并发场景审计通过", ok, str(failed))
+
+
 def test_tamper_detection(srv: Server):
     print("\n[11] 账本篡改检测（哈希链 + 重放不等价）")
     c = srv.client
@@ -762,6 +1132,7 @@ def main():
         test_concurrent_replay_safe(srv)
         test_restart_rebuild(srv)
         test_lease_amend(srv)
+        test_capacity_plans(srv)
         test_tamper_detection(srv)
 
         print("\n[终态审计]")

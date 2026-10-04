@@ -14,6 +14,12 @@
   POST /api/leases/release     归还租约（释放未消费部分）
   POST /api/leases/revoke      父级撤销/缩容（有下级占用时拒绝）
   POST /api/clients/presence   客户端上/下线（离线关闭其全部租约）
+  POST /api/capacity-plans                 创建批量容量调整草案
+  POST /api/capacity-plans/preview         预览草案（逐层余额/受影响租约/拒绝原因）
+  POST /api/capacity-plans/publish         原子发布（陈旧版本拒绝，要求重新预览）
+  POST /api/capacity-plans/discard         废弃草案
+  GET  /api/capacity-plans                 草案列表
+  GET  /api/capacity-plans/{id}            草案详情（含发布结果）
 """
 
 from __future__ import annotations
@@ -101,6 +107,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self._service().audit())
             if path == "/api/events":
                 return self._json(200, {"events": self._service().events()})
+            if path == "/api/capacity-plans":
+                return self._json(200, self._service().list_plans())
+            if path.startswith("/api/capacity-plans/"):
+                plan_id = path[len("/api/capacity-plans/") :].strip("/")
+                if plan_id:
+                    return self._json(200, self._service().get_plan(plan_id))
             if path in ("/", "/index.html"):
                 return self._serve_static("index.html", "text/html; charset=utf-8")
             if path.startswith("/static/"):
@@ -117,6 +129,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         try:
+            if path.startswith("/api/capacity-plans/"):
+                action = path[len("/api/capacity-plans/") :].strip("/")
+                plan_methods = {
+                    "preview": "preview_plan",
+                    "publish": "publish_plan",
+                    "discard": "discard_plan",
+                }
+                method_name = plan_methods.get(action)
+                if method_name is None:
+                    self._json(404, {"error": "not_found", "message": f"未知路径: {path}"})
+                    return
+                body = self._read_body()
+                result = getattr(self._service(), method_name)(body)
+                # 预览只是刷新预览基线（不产生用户可见的新资源），固定 200
+                code = 200 if action == "preview" else (200 if result.get("replayed") else 201)
+                return self._json(code, result)
+            if path == "/api/capacity-plans":
+                body = self._read_body()
+                result = self._service().create_plan(body)
+                code = 200 if result.get("replayed") else 201
+                return self._json(code, result)
             kind = KIND_BY_PATH.get(path)
             if kind is None:
                 self._json(404, {"error": "not_found", "message": f"未知路径: {path}"})

@@ -16,7 +16,8 @@ python3 -m quota.http_server --port 8765 --db ./quota.db
 # 打开 http://localhost:8765/ 即为租约控制台
 ```
 
-跑测试（功能 / 并发 / 到期 / 离线 / 续约 / 重启重建 / 账本篡改，共 147 项）：
+跑测试（功能 / 并发 / 到期 / 离线 / 续约 / 重启重建 / 账本篡改 /
+批量容量草案，共 220 项）：
 
 ```bash
 python3 test_service.py
@@ -43,12 +44,17 @@ HTTP (http_server.py)
 | `Bootstrapped` | 设置全局容量（一次性） |
 | `NodeRegistered` | 注册组织 / 项目 / 客户端 |
 | `CapacityAdjusted` | 调整全局容量（缩容防超卖） |
+| `NodeCapacityAdjusted` | 调整节点显式容量：沿父子边移动余额（批量草案发布产生） |
 | `LeaseGranted` | 父子节点间授予一条租约 |
 | `UsageRecorded` | 幂等用量回执，按 `usage_event_id` 去重 |
 | `LeaseExpired` | 租约到期，标记 `pending_expired`（不动余额） |
 | `LeaseAmended` | 修订有效期：截止时间延后，租约修订号 +1（不动余额） |
 | `LeaseClosed` | 结算租约，退回未消费余量（修订号同样 +1） |
 | `ClientPresenceChanged` | 客户端上 / 下线 |
+| `CapacityPlanCreated` | 批量容量调整草案创建（不动余额，记录创建时账本位置） |
+| `CapacityPlanPreviewed` | 草案在某账本水位完成预览（不动余额） |
+| `CapacityPlanPublished` | 草案发布完成（紧随整批 `NodeCapacityAdjusted`/`CapacityAdjusted`） |
+| `CapacityPlanDiscarded` | 草案废弃 |
 
 每条事件带 `prev_hash/event_hash`（SHA-256 链）与所属 `command_id`，
 篡改任意载荷都会让审计的哈希链检查断裂。
@@ -108,6 +114,38 @@ HTTP (http_server.py)
 不会因相对延长量而重新计算。修订号、截止时间与修订历史都只存在于事件账本，
 重启重放后完整恢复。
 
+### 批量容量调整草案（原子批次 + 乐观账本位置）
+
+管理员可以把**多条节点容量变更**编辑成一份草案（`draft`），先预览再发布：
+
+1. **创建** `POST /api/capacity-plans`：只做结构校验（节点存在、无重复、容量非负），
+   记录创建时的**账本位置**（业务水位 `base_seq`）。草案不动任何余额。
+2. **预览** `POST /api/capacity-plans/preview`：在内存副本上按顺序推演整批变更，
+   返回逐项校验结果（每项的旧/新容量、Δ、**拒绝原因**）、**执行后的逐层余额**
+   （平台→各变更节点的祖先链）与**受影响的未结算租约**（出租方/持有方角色、
+   余额前后快照）。预览把「最后预览水位」与快照一起持久化。
+3. **发布** `POST /api/capacity-plans/publish`：满足全部前提才把整批变更作为
+   **一个原子批次**写入——业务事件（`NodeCapacityAdjusted`，平台项为
+   `CapacityAdjusted`）与 `CapacityPlanPublished` 及草案表状态在**同一 SQLite
+   事务**提交，**任一项不合法则整批回滚、没有任何变更生效**。
+4. **废弃** `POST /api/capacity-plans/discard`：草案可废弃；废弃/发布后状态不可逆。
+
+容量调整的记账只是沿**父子边移动余额**：扩容 `Δ>0` 时父级出 `Δ`（父级可用不足
+拒绝），缩容 `Δ<0` 时节点退回 `−Δ`（节点当前可用不足、会被抽成负数时拒绝）。
+因此「非负余额」与「全局守恒」对整批调整天然恒成立。
+
+**陈旧版本（乐观账本位置）**：发布要求「最后一次预览的业务水位 == 当前水位」。
+水位取 `MAX(seq)` 中**排除草案生命周期事件**的业务事件序号，所以创建/预览草案后
+发生的任何**新授约、消费、续约、结算（含后台到期 sweep）、容量调整、上/下线**
+都会推进水位，使发布返回 `409` 并在 `details.intervening_changes` 中列出发生了
+哪类变更、提示需要**重新预览**；而另一份草案的创建/预览/废弃不会互相干扰。
+重新预览即刷新基线，随后可发布。
+
+**幂等与持久化**：重复发布（无论是否同一 `command_id`）只能得到**首次发布结果**；
+草案创建支持显式 `command_id` 重试幂等；废弃幂等。草案权威行存于 `capacity_plans`
+表，生命周期事件同时进哈希链，**服务重启后**草案、预览快照、首次发布结果与审计
+轨迹均可查询（审计新增 `capacity_plan_consistency`：表行与账本折叠逐字段一致）。
+
 ### 防超卖 / 一致性的四道防线
 
 1. **进程内串行**：所有命令在同一把锁内“到期结算 → 去重 → 校验 → 原子提交”；
@@ -132,6 +170,12 @@ HTTP (http_server.py)
 | `POST /api/leases/release` | `{lease_id, expected_revision?}` 归还（释放未消费） |
 | `POST /api/leases/revoke` | `{lease_id, expected_revision?}` 父级撤销 / 缩容 |
 | `POST /api/clients/presence` | `{client_id, online}` 上 / 下线 |
+| `POST /api/capacity-plans` | `{changes:[{node_id,capacity}], plan_id?}` 创建批量容量调整草案 |
+| `POST /api/capacity-plans/preview` | `{plan_id}` 预览：逐层余额 / 受影响租约 / 逐项拒绝原因 |
+| `POST /api/capacity-plans/publish` | `{plan_id}` 原子发布；陈旧版本 409 要求重新预览 |
+| `POST /api/capacity-plans/discard` | `{plan_id}` 废弃草案 |
+| `GET /api/capacity-plans` | 草案列表 |
+| `GET /api/capacity-plans/{id}` | 草案详情（含预览快照 / 首次发布结果） |
 | `GET /api/state` | 全量节点余额 + 租约视图 |
 | `GET /api/audit` | 一致性审计（见下） |
 | `GET /api/events` | 最近事件账本 |
@@ -143,9 +187,10 @@ HTTP (http_server.py)
 
 ### 审计 `GET /api/audit`
 
-每次执行 7 项检查：哈希链完整、幂等命令表一致、非负余额、全局守恒、
-层级边完整、租约记账合法、以及**从事件重放重建的状态与线上投影逐字段
-一致**（`replay_equivalence`）。
+每次执行 8 项检查：哈希链完整、幂等命令表一致、非负余额、全局守恒、
+层级边完整、租约记账合法、**从事件重放重建的状态与线上投影逐字段
+一致**（`replay_equivalence`）、以及**容量调整草案表与账本折叠结果逐字段
+一致**（`capacity_plan_consistency`：状态机、变更清单、创建水位、发布结果）。
 
 ---
 
@@ -153,9 +198,10 @@ HTTP (http_server.py)
 
 | 文件 | 职责 |
 |---|---|
-| `quota/ledger.py` | SQLite 事件存储、确定性哈希、批量原子提交 |
+| `quota/ledger.py` | SQLite 事件存储、确定性哈希、批量原子提交、草案表同事务写入 |
 | `quota/domain.py` | 事件折叠、命令校验、余额模型、到期结算 |
-| `quota/service.py` | 命令执行 / 幂等 / 重建 / 后台 sweep / 审计 |
+| `quota/plans.py` | 批量容量草案：结构校验、预览模拟、生命周期事件构造 |
+| `quota/service.py` | 命令执行 / 幂等 / 重建 / 后台 sweep / 草案编排 / 审计 |
 | `quota/http_server.py` | HTTP 路由与静态页面 |
-| `static/index.html` | 租约控制台（节点树、租约操作、审计、账本） |
-| `test_service.py` | 147 项端到端测试（含真实重启、并发与续约竞争） |
+| `static/index.html` | 租约控制台（节点树、租约操作、容量草案、审计、账本） |
+| `test_service.py` | 220 项端到端测试（含真实重启、并发、续约竞争与草案全流程） |
